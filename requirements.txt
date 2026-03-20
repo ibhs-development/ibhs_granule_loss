@@ -1,0 +1,7 @@
+numpy
+pandas
+scipy
+scikit-image
+opencv-python
+matplotlib
+pyinstaller
