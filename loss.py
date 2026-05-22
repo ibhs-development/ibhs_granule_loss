@@ -1,7 +1,5 @@
-import os
-import re
-import glob
 import warnings
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +8,7 @@ import cv2
 import matplotlib.pyplot as plt
 from skimage.measure import label, regionprops
 from scipy import stats
+from PIL import Image
 
 # The script will scan this folder for image pairs.
 # All steps we need
@@ -27,6 +26,11 @@ OUTPUT_FIG = "Completed_GL"          # figure file name
 # the threshold for IGL vs PGL classification (2.58 mm²)
 IGL_CUTOFF_MM2 = 2.58
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+CROPPED_SUFFIX = "_cropped"
+GENERATED_IMAGE_SUFFIXES = (CROPPED_SUFFIX, "_cleaned")
+IGNORED_OUTPUT_FILENAMES = {"granule_loss_plot.png"}
+
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -36,16 +40,6 @@ def _read_rgb(path: Path) -> np.ndarray:
     if img is None:
         raise FileNotFoundError(f"Could not read image: {path}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-def resize_long_side(img: np.ndarray, target_max_dim: int) -> np.ndarray:
-    """Resize so that the longer dimension == target_max_dim."""
-    h, w = img.shape[:2]
-    scale = target_max_dim / max(h, w)
-    if scale >= 1:
-        return img.copy()
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 def detect_scale_mm(image_path, target_max_dim=1200, bottom_frac=0.4, px_threshold=None):
     img = cv2.imread(image_path)
@@ -87,7 +81,7 @@ def detect_scale_mm(image_path, target_max_dim=1200, bottom_frac=0.4, px_thresho
             bar_w = best_w
 
     if bar_w is None:
-        return {"mm": None, "bar_width_px": None, "normalized_width": W}
+        return None
 
     # Decide 10 vs 20
     if px_threshold is not None:
@@ -100,126 +94,257 @@ def detect_scale_mm(image_path, target_max_dim=1200, bottom_frac=0.4, px_thresho
 
     return mm
 
-def find_image_pairs(root_folder='results'):
+def luminance(rgb: np.ndarray) -> np.ndarray:
+    """Return grayscale luminance for an RGB image array."""
+    return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
+
+
+def estimate_background(rgb: np.ndarray) -> np.ndarray:
+    """Use the median very-bright pixel as fill color; fall back to white."""
+    gray = luminance(rgb)
+    bright_pixels = rgb[gray >= 245]
+    if len(bright_pixels) < 100:
+        return np.array([255, 255, 255], dtype=np.uint8)
+    return np.median(bright_pixels, axis=0).astype(np.uint8)
+
+
+def find_red_scale_line(
+    rgb: np.ndarray,
+    red_min: int = 140,
+    red_gap: int = 50,
+    search_x_fraction: float = 0.35,
+    search_y_fraction: float = 0.50,
+) -> tuple[int, int, int, int] | None:
     """
-    Scans a directory for original and associated image pairs in all subfolders.
+    Find the horizontal red reference line in the lower-right part of the image.
 
-    Args:
-        root_folder (str): The path to the main folder to start scanning from (e.g., 'results').
-
-    Returns:
-        pandas.DataFrame: A DataFrame containing the matched image pairs with columns:
-                          'Impact', 'original', 'cropped'.
-                          Returns an empty DataFrame if the root folder doesn't exist or no pairs are found.
+    Returns (x1, y1, x2, y2), or None if no red line is found.
     """
-    if not os.path.isdir(root_folder):
-        print(f"Error: The directory '{root_folder}' does not exist.")
-        return pd.DataFrame()
+    h, w = rgb.shape[:2]
+    x0 = int(w * search_x_fraction)
+    y0 = int(h * search_y_fraction)
+    crop = rgb[y0:, x0:]
 
-    all_pairs = []
+    r = crop[:, :, 0].astype(np.int16)
+    g = crop[:, :, 1].astype(np.int16)
+    b = crop[:, :, 2].astype(np.int16)
+    red = (r >= red_min) & ((r - g) >= red_gap) & ((r - b) >= red_gap)
 
-    # Regex to find original images like '1.png', '12.png'
-    original_regex = re.compile(r'^(\d+)\.png$')
+    row_counts = red.sum(axis=1)
+    if row_counts.size == 0 or row_counts.max() < 20:
+        return None
 
-    # Regex patterns for associated images
-    # Pattern 1 (number in the middle): e.g., ..._S1_19_gl.png
-    assoc_regex_1 = re.compile(r'_(\d+)_gl\.png$')
-    # Pattern 2 (number at the end): e.g., ..._gl15.png
-    assoc_regex_2 = re.compile(r'_gl(\d+)\.png$')
-    # Pattern 3
-    assoc_regex_3 = re.compile(r'_gls(\d+)\.png$')
+    row_threshold = max(10, int(row_counts.max() * 0.35))
+    candidate_rows = np.flatnonzero(row_counts >= row_threshold)
+    if len(candidate_rows) == 0:
+        return None
 
-    print(f"🔍 Starting scan in '{root_folder}'...")
+    groups = np.split(candidate_rows, np.where(np.diff(candidate_rows) > 1)[0] + 1)
+    best_group = max(groups, key=lambda rows: row_counts[rows].sum())
 
-    # Get all first-level subdirectories
-    first_level_dirs = [d for d in os.listdir(root_folder)
-                        if os.path.isdir(os.path.join(root_folder, d))]
+    line_region = red[best_group.min(): best_group.max() + 1, :]
+    xs = np.flatnonzero(line_region.any(axis=0))
+    if len(xs) == 0:
+        return None
 
-    for first_level_dir in first_level_dirs:
-        first_level_path = os.path.join(root_folder, first_level_dir)
+    return (
+        x0 + int(xs.min()),
+        y0 + int(best_group.min()),
+        x0 + int(xs.max()),
+        y0 + int(best_group.max()),
+    )
 
-        # Get all second-level subdirectories (or empty if none exist)
-        second_level_dirs = [d for d in os.listdir(first_level_path)
-                             if os.path.isdir(os.path.join(first_level_path, d))]
 
-        # If there are second-level subdirectories, process them
-        if second_level_dirs:
-            for second_level_dir in second_level_dirs:
-                second_level_path = os.path.join(first_level_path, second_level_dir)
-                process_directory(second_level_path, first_level_dir, second_level_dir,
-                                  original_regex, assoc_regex_1, assoc_regex_2, assoc_regex_3, all_pairs)
+def annotation_mask(
+    rgb: np.ndarray,
+    line_box: tuple[int, int, int, int],
+    annotation_dark_threshold: int,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Build a mask for the red line and dark/gray scale label near the line."""
+    h, w = rgb.shape[:2]
+    x1, y1, x2, y2 = line_box
+    line_len = max(1, x2 - x1 + 1)
+
+    pad_left = int(0.45 * line_len)
+    pad_right = int(0.30 * line_len)
+    pad_top = max(80, int(0.70 * line_len))
+    pad_bottom = max(20, int(0.18 * line_len))
+
+    bx1 = max(0, x1 - pad_left)
+    by1 = max(0, y1 - pad_top)
+    bx2 = min(w, x2 + pad_right + 1)
+    by2 = min(h, y2 + pad_bottom + 1)
+
+    box = rgb[by1:by2, bx1:bx2]
+    r = box[:, :, 0].astype(np.int16)
+    g = box[:, :, 1].astype(np.int16)
+    b = box[:, :, 2].astype(np.int16)
+    red = (r >= 120) & ((r - g) >= 40) & ((r - b) >= 40)
+    dark_or_gray = luminance(box) <= annotation_dark_threshold
+
+    mask = np.zeros((h, w), dtype=bool)
+    mask[by1:by2, bx1:bx2] = red | dark_or_gray
+    return mask, (bx1, by1, bx2, by2)
+
+
+def edge_connected_mask(
+    dark: np.ndarray,
+    edge_margin: int,
+    eight_connected: bool = True,
+) -> np.ndarray:
+    """Return dark pixels connected to any image edge or edge-margin band."""
+    h, w = dark.shape
+    edge_margin = max(1, min(edge_margin, h, w))
+
+    seeds = np.zeros_like(dark, dtype=bool)
+    seeds[:edge_margin, :] |= dark[:edge_margin, :]
+    seeds[-edge_margin:, :] |= dark[-edge_margin:, :]
+    seeds[:, :edge_margin] |= dark[:, :edge_margin]
+    seeds[:, -edge_margin:] |= dark[:, -edge_margin:]
+
+    remove = np.zeros_like(dark, dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+
+    seed_y, seed_x = np.nonzero(seeds)
+    for y, x in zip(seed_y, seed_x):
+        remove[y, x] = True
+        queue.append((int(y), int(x)))
+
+    if eight_connected:
+        neighbors = (
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1),
+        )
+    else:
+        neighbors = ((-1, 0), (0, -1), (0, 1), (1, 0))
+
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in neighbors:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and dark[ny, nx] and not remove[ny, nx]:
+                remove[ny, nx] = True
+                queue.append((ny, nx))
+
+    return remove
+
+
+def clean_shingle_artifacts(
+    image_path: Path,
+    output_path: Path,
+    edge_dark_threshold: int = 180,
+    edge_margin: int = 8,
+    annotation_dark_threshold: int = 235,
+) -> dict[str, object]:
+    """
+    Generate the cropped/cleaned analysis image beside a scale-bar source image.
+
+    The generated image keeps the original width and height, but removes dark
+    border artifacts and the scale annotation so only loss regions remain.
+    """
+    with Image.open(image_path) as image:
+        image = image.convert("RGB")
+        rgb = np.array(image)
+
+    fill_color = estimate_background(rgb)
+    gray = luminance(rgb)
+
+    edge_dark = gray <= edge_dark_threshold
+    remove = edge_connected_mask(edge_dark, edge_margin=edge_margin)
+
+    line_box = find_red_scale_line(rgb)
+    annotation_box = None
+    if line_box is not None:
+        annotation_remove, annotation_box = annotation_mask(
+            rgb,
+            line_box=line_box,
+            annotation_dark_threshold=annotation_dark_threshold,
+        )
+        remove |= annotation_remove
+
+    cleaned = rgb.copy()
+    cleaned[remove] = fill_color
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(cleaned).save(output_path)
+
+    return {
+        "input": str(image_path),
+        "output": str(output_path),
+        "size": f"{rgb.shape[1]}x{rgb.shape[0]}",
+        "removed_pixels": int(remove.sum()),
+        "scale_line_found": line_box is not None,
+        "annotation_box": annotation_box,
+    }
+
+
+def cropped_output_path(input_path: Path, suffix: str = CROPPED_SUFFIX) -> Path:
+    return input_path.with_name(f"{input_path.stem}{suffix}{input_path.suffix}")
+
+
+def is_generated_crop(path: Path, suffix: str = CROPPED_SUFFIX) -> bool:
+    generated_suffixes = tuple(dict.fromkeys((suffix, *GENERATED_IMAGE_SUFFIXES)))
+    return path.stem.endswith(generated_suffixes)
+
+
+def impact_name_from_path(image_path: Path, root_folder: Path) -> str:
+    rel = image_path.relative_to(root_folder).with_suffix("").as_posix()
+    name = "".join(ch if ch.isalnum() else "_" for ch in rel)
+    return "_".join(part for part in name.split("_") if part) or image_path.stem
+
+
+def generate_image_pairs(
+    root_folder: str | Path,
+    cropped_suffix: str = CROPPED_SUFFIX,
+    log_callback=None,
+) -> pd.DataFrame:
+    """
+    Scan for scale-bar input images, generate their cropped/cleaned partners,
+    and return the pair table used by the analysis pipeline.
+    """
+    root_path = Path(root_folder)
+    if not root_path.is_dir():
+        raise FileNotFoundError(f"The input folder does not exist: {root_path}")
+
+    def log(message):
+        if log_callback:
+            log_callback(message)
         else:
-            # If no second-level subdirectories, process first-level directory directly
-            process_directory(first_level_path, first_level_dir, None,
-                              original_regex, assoc_regex_1, assoc_regex_2, assoc_regex_3, all_pairs)
+            print(message)
 
-    print(f"✅ Scan complete. Found {len(all_pairs)} matched pairs.")
-    df = pd.DataFrame(all_pairs)
+    source_images = [
+        path
+        for path in sorted(root_path.rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+        and path.name not in IGNORED_OUTPUT_FILENAMES
+        and not is_generated_crop(path, cropped_suffix)
+    ]
 
-    return df
+    if not source_images:
+        return pd.DataFrame(columns=["Impact", "original", "cropped"])
+
+    log(f"Found {len(source_images)} scale-bar image(s). Generating cropped copies...")
+
+    pairs = []
+    for image_path in source_images:
+        crop_path = cropped_output_path(image_path, cropped_suffix)
+        info = clean_shingle_artifacts(image_path=image_path, output_path=crop_path)
+        impact = impact_name_from_path(image_path, root_path)
+        log(
+            f"  - {image_path.relative_to(root_path)} -> {crop_path.name} | "
+            f"removed {info['removed_pixels']} px | scale line found: {info['scale_line_found']}"
+        )
+        pairs.append({
+            "Impact": impact,
+            "original": image_path.as_posix(),
+            "cropped": crop_path.as_posix(),
+        })
+
+    return pd.DataFrame(pairs)
 
 
-def process_directory(dirpath, first_level_name, second_level_name,
-                      original_regex, assoc_regex_1, assoc_regex_2, assoc_regex_3, all_pairs):
-    """
-    Helper function to process a directory and find matching image pairs.
-
-    Args:
-        dirpath: Path to the directory to process
-        first_level_name: Name of the first-level folder
-        second_level_name: Name of the second-level folder (or None if processing first-level)
-        original_regex: Regex pattern for original images
-        assoc_regex_1, assoc_regex_2, assoc_regex_3: Regex patterns for associated images
-        all_pairs: List to append found pairs to
-    """
-    originals = {}
-    associated = []
-
-    # Get all files in the directory
-    filenames = [f for f in os.listdir(dirpath) if os.path.isfile(os.path.join(dirpath, f))]
-
-    # First, categorize all files in the current directory
-    for filename in filenames:
-        # Check if it's an original image
-        original_match = original_regex.match(filename)
-        if original_match:
-            number = int(original_match.group(1))
-            originals[number] = filename
-            continue
-
-        # Check if it's an associated image using our patterns
-        assoc_match = assoc_regex_1.search(filename)
-        if not assoc_match:
-            assoc_match = assoc_regex_2.search(filename)
-        if not assoc_match:
-            assoc_match = assoc_regex_3.search(filename)
-
-        if assoc_match:
-            number = int(assoc_match.group(1))
-            associated.append({'number': number, 'filename': filename})
-
-    # Second, match the categorized originals with their associated counterparts
-    for assoc_img in associated:
-        ref_num = assoc_img['number']
-        if ref_num in originals:
-            original_filename = originals[ref_num]
-            assoc_filename = assoc_img['filename']
-
-            # Construct the full path from the root
-            original_full_path = os.path.join(dirpath, original_filename)
-            assoc_full_path = os.path.join(dirpath, assoc_filename)
-
-            # Create impact name based on whether we have second-level folder
-            if second_level_name:
-                impact_name = f"{first_level_name.replace(' ', '_')}_{second_level_name.replace(' ', '_')}_{ref_num}"
-            else:
-                impact_name = f"{first_level_name.replace(' ', '_')}_{ref_num}"
-
-            all_pairs.append({
-                'Impact': impact_name,
-                'original': Path(original_full_path).as_posix(),
-                'cropped': Path(assoc_full_path).as_posix()
-            })
 # ------------------------------------------------------------
 # Robust mm/px from ORIGINAL image (uses your detect_scale_mm)
 # ------------------------------------------------------------
@@ -272,53 +397,6 @@ def compute_scale_mm_per_px(img_path: Path) -> float:
         bar_mm = 20
 
     return float(bar_mm) / float(long_side_px)
-
-def _largest_component_bbox(mask: np.ndarray):
-    """Return (bbox, area_px) for the largest CC. bbox=(min_row, min_col, max_row, max_col)."""
-    labeled = label(mask)
-    props = regionprops(labeled)
-    if not props:
-        return None, 0
-    largest = max(props, key=lambda p: p.area)
-    return largest.bbox, largest.area
-
-
-# backup function for compute_scale_mm_per_px
-def detect_scale_mm_per_px(img_path: Path) -> float:
-    """
-    Detect the red scale bar in an ORIGINAL image and return mm/px.
-    Uses HSV + morphology + minAreaRect for a robust pixel length, then
-    calls your detect_scale_mm() to decide 10 mm vs 20 mm.
-    """
-    rgb = _read_rgb(img_path)
-
-    # --- robust red mask in HSV (two hue ranges because red wraps) ---
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    # lower/upper bounds: adjust S,V from 80 if your bar is dimmer/brighter
-    low1, high1 = (0, 80, 80), (10, 255, 255)
-    low2, high2 = (170, 80, 80), (180, 255, 255)
-    mask = cv2.inRange(hsv, np.array(low1), np.array(high1)) | \
-           cv2.inRange(hsv, np.array(low2), np.array(high2))
-
-    # Clean and select largest component
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=2)
-    n_labels, labels = cv2.connectedComponents(mask)
-    if n_labels <= 1:
-        raise ValueError(f"No red scale bar detected in {img_path}")
-
-    areas = [(labels == i).sum() for i in range(1, n_labels)]
-    max_idx = int(np.argmax(areas)) + 1
-    mask_largest = (labels == max_idx).astype(np.uint8)
-
-    y0, x0, y1, x1 = _largest_component_bbox(mask_largest)[0]
-    if y0 is None:
-        raise ValueError("Could not find a valid bounding box for the red bar.")
-    w = x1 - x0
-
-    # Decide 10 vs 20 mm using your original logic
-    mm_mark = detect_scale_mm(rgb)
-    mm_per_px = mm_mark / float(max(w, 1))
-    return mm_per_px
 
 def gl_mask_from_cropped(rgb_crop: np.ndarray) -> np.ndarray:
     """
@@ -422,12 +500,16 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
         else:
             print(message)
 
-    image_pairs_df = find_image_pairs(root_folder=input_folder)
+    image_pairs_df = generate_image_pairs(
+        root_folder=input_folder,
+        cropped_suffix=CROPPED_SUFFIX,
+        log_callback=log,
+    )
 
     if image_pairs_df.empty:
         raise ValueError(
-            f"No matching image pairs were found in '{input_folder}'. "
-            "Please check your folder structure and filenames."
+            f"No supported scale-bar images were found in '{input_folder}'. "
+            f"Supported extensions: {', '.join(sorted(IMAGE_EXTENSIONS))}."
         )
 
     rows = []
@@ -479,6 +561,8 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
 
         rows.append({
             "Impact": impact_name,
+            "Original_Image": str(p_orig),
+            "Cropped_Image": str(p_crop),
             "Count_IGL": int(igl.size),
             "Count_PGL": int(pgl.size),
             "AreaSum_IGL_mm2": float(np.sum(igl)) if igl.size else 0.0,
@@ -560,9 +644,9 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    fig_path = output_path / "granule_loss_plot.png"
+    # fig_path = output_path / "granule_loss_plot.png"
     # fig.savefig(str(fig_path), dpi=300, bbox_inches="tight")
-    log(f"\nSaved figure to: {fig_path}")
+    # log(f"\nSaved figure to: {fig_path}")
 
     # ------------------------------------------------------------
     # Output summary table and distributions

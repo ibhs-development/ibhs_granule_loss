@@ -1,23 +1,24 @@
 # IBHS Granule Loss Analysis
 
-IBHS desktop tool for analyzing granule loss from paired microscope shingle images.
+IBHS desktop tool for analyzing granule loss from microscope shingle images that include a red scale bar.
 
 The project provides:
 - A Tkinter GUI (`app.py`) for selecting folders, running analysis, and viewing logs/plots
-- A processing pipeline (`loss.py`) that detects image pairs, computes scale from a red reference bar, segments granule-loss regions, and computes IGL/PGL metrics
+- A processing pipeline (`loss.py`) that generates cropped/cleaned analysis images, computes scale from a red reference bar, segments granule-loss regions, and computes IGL/PGL metrics
 
 ## What the analysis does
 
-For each matched image pair:
-1. Finds image pairs (`original` + `cropped`) from nested folders.
-2. Detects red scale bar in the original image to estimate `mm_per_px`.
-3. Segments granule-loss regions in the cropped image using local-density thresholding.
-4. Measures connected-component areas in `mm²`.
-5. Splits areas into:
-- `IGL`: area `< threshold` (default `2.58 mm²`)
-- `PGL`: area `>= threshold`
-6. Computes percentile-based severity levels and final ratings (`0..3`) per impact.
-7. Produces pooled distribution plots and a CSV summary.
+For each source image:
+1. Scans the input folder recursively for scale-bar images.
+2. Generates a cropped/cleaned analysis image beside each source as `*_cropped.*`.
+3. Detects red scale bar in the original image to estimate `mm_per_px`.
+4. Segments granule-loss regions in the generated cropped image using local-density thresholding.
+5. Measures connected-component areas in `mm²`.
+6. Splits areas into:
+   - `IGL`: area `< threshold` (default `2.58 mm²`)
+   - `PGL`: area `>= threshold`
+7. Computes percentile-based severity levels and final ratings (`0..3`) per impact.
+8. Produces pooled distribution plots and a CSV summary.
 
 ## Requirements
 
@@ -32,20 +33,21 @@ pip install -r requirements.txt
 
 ## Input data expectations
 
-Set an **Input Folder** that contains first-level and optionally second-level subfolders.
+Set a **Scale-image folder** that contains the processed microscope images with scale bars. The scan is recursive, so nested folders are okay.
 
-Inside each processed folder, pairing is based on filename patterns:
-- Original image: `N.png` (example: `1.png`, `12.png`)
-- Associated cropped image can match one of:
-- `..._N_gl.png`
-- `..._glN.png`
-- `..._glsN.png`
+Supported image extensions:
+- `.png`
+- `.jpg`
+- `.jpeg`
+- `.tif`
+- `.tiff`
+- `.bmp`
 
-Where `N` is the same numeric index used for the original image.
+The app no longer needs pre-existing associated `*_gl` images. It creates the cropped/cleaned analysis image automatically in the same folder as the source image:
 
-Example valid pair:
+Example generated pair:
 - `12.png`
-- `sample_gl12.png`
+- `12_cropped.png`
 
 ## Run the app (GUI)
 
@@ -54,16 +56,19 @@ python app.py
 ```
 
 In the GUI:
-- Select **Input Folder**
-- Select **Output Folder**
+- Select **Scale-image folder**
+- Select **Results folder** or leave it blank to use `granule_loss_results` under the selected input folder
 - Optionally set **IGL vs PGL Threshold (mm²)** (default: `2.58`)
-- Click **Run Analysis**
+- Click **Generate Crops + Analyze**
 
 ## Output files
 
 In the selected output folder:
 - `granule_loss_results.csv` 
-- Plot is generated and shown in GUI; expected output filename is `granule_loss_plot.png`
+- `granule_loss_plot.png`
+
+In the selected input folder:
+- `*_cropped.*` generated beside each source image
 
 ## Code review notes
 - If scale detection fails, code falls back to `20/300 mm/px`; results may be less accurate for those samples.
