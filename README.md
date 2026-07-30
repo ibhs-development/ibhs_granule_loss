@@ -17,8 +17,11 @@ For each source image:
 6. Splits areas into:
    - `IGL`: area `< threshold` (default `2.58 mm²`)
    - `PGL`: area `>= threshold`
-7. Computes percentile-based severity levels and final ratings (`0..3`) per impact.
-8. Produces pooled distribution plots and a CSV summary.
+7. Writes an annotated (analysed) image beside each source as `*_annotated.*`, with every
+   detected loss region tinted, outlined (blue = IGL, red = PGL) and labelled with its area
+   in `mm²`, plus a header showing the per-image counts and area sums and a mm scale bar.
+8. Computes percentile-based severity levels and final ratings (`0..3`) per impact.
+9. Produces pooled distribution plots, a per-image CSV summary, and a per-region CSV.
 
 ## Requirements
 
@@ -45,9 +48,10 @@ Supported image extensions:
 
 The app no longer needs pre-existing associated `*_gl` images. It creates the cropped/cleaned analysis image automatically in the same folder as the source image:
 
-Example generated pair:
+Example generated set:
 - `12.png`
-- `12_cropped.png`
+- `12_cropped.png` (cleaned image the measurements are taken from)
+- `12_annotated.png` (same image with each loss area labelled in `mm²`)
 
 ## Run the app (GUI)
 
@@ -64,14 +68,25 @@ In the GUI:
 ## Output files
 
 In the selected output folder:
-- `granule_loss_results.csv` 
+- `granule_loss_results.csv` — one row per image: `Count_IGL`, `Count_PGL`, `Count_All`,
+  `AreaSum_IGL_mm2`, `AreaSum_PGL_mm2`, `AreaSum_All_mm2`, ratings, `mm_per_px_original`,
+  and the paths of the cropped and annotated images
+- `granule_loss_regions.csv` — one row per detected loss region: `Impact`, `Region_ID`,
+  `Class` (`IGL`/`PGL`), `Area_px`, `Area_mm2`, centroid, and whether it got an on-image label
 - `granule_loss_plot.png`
 
 In the selected input folder:
 - `*_cropped.*` generated beside each source image
+- `*_annotated.*` generated beside each source image
 
 ## Code review notes
 - If scale detection fails, code falls back to `20/300 mm/px`; results may be less accurate for those samples.
+- Annotated images show exactly what the segmenter measured. Spots missed by the
+  local-density segmentation are neither annotated nor counted — tune `LOCAL_DENSITY_THRESH`
+  and `LOCAL_DENSITY_K` in `loss.py` if faint or very small losses are being skipped.
+- Very small regions (`< ANNOTATION_MIN_LABEL_AREA_PX`) and regions whose label would
+  overlap another label stay outlined but unlabelled; the header reports how many were
+  labelled, and every area is in `granule_loss_regions.csv`.
 
 ## Build Windows EXE with PyInstaller
 

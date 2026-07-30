@@ -47,7 +47,7 @@ class GranuleLossApp:
         )
         ttk.Label(
             main_frame,
-            text="Select a folder of scale-bar images. Cropped analysis copies are saved beside each source image.",
+            text="Select a folder of scale-bar images. Cropped and annotated analysis copies are saved beside each source image.",
         ).grid(row=1, column=0, sticky=tk.W, pady=(2, 12))
 
         folder_frame = ttk.LabelFrame(main_frame, text="Folders", padding="12")
@@ -127,6 +127,7 @@ class GranuleLossApp:
             "Count_PGL",
             "AreaSum_IGL_mm2",
             "AreaSum_PGL_mm2",
+            "AreaSum_All_mm2",
             "GL_Rating",
             "CombinedGL_Rating",
         )
@@ -233,7 +234,8 @@ class GranuleLossApp:
             self.log_message(f"\nInput Folder: {input_folder}")
             self.log_message(f"Output Folder: {output_folder}")
             self.log_message(f"IGL/PGL Threshold: {threshold} mm2\n")
-            self.log_message("Cropped images will be saved beside each source as *_cropped.*\n")
+            self.log_message("Cropped images will be saved beside each source as *_cropped.*")
+            self.log_message("Annotated images with per-spot areas will be saved as *_annotated.*\n")
 
             # Run the analysis
             summary_df, fig = process_granule_loss(

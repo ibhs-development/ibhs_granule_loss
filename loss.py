@@ -28,8 +28,16 @@ IGL_CUTOFF_MM2 = 2.58
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 CROPPED_SUFFIX = "_cropped"
-GENERATED_IMAGE_SUFFIXES = (CROPPED_SUFFIX, "_cleaned")
+ANNOTATED_SUFFIX = "_annotated"
+GENERATED_IMAGE_SUFFIXES = (CROPPED_SUFFIX, ANNOTATED_SUFFIX, "_cleaned")
 IGNORED_OUTPUT_FILENAMES = {"granule_loss_plot.png"}
+
+# Annotated (analysed) image rendering
+IGL_COLOR = (0, 110, 230)          # RGB, blue: individual granule loss (< cutoff)
+PGL_COLOR = (225, 35, 35)          # RGB, red: path granule loss (>= cutoff)
+ANNOTATION_FILL_ALPHA = 0.32       # tint strength over each detected loss region
+ANNOTATION_MIN_LABEL_AREA_PX = 10  # regions smaller than this are outlined but not labelled
+SCALE_BAR_CANDIDATES_MM = (1, 2, 5, 10, 20, 50, 100)
 
 # -----------------------------
 # Utilities
@@ -283,6 +291,10 @@ def cropped_output_path(input_path: Path, suffix: str = CROPPED_SUFFIX) -> Path:
     return input_path.with_name(f"{input_path.stem}{suffix}{input_path.suffix}")
 
 
+def annotated_output_path(input_path: Path, suffix: str = ANNOTATED_SUFFIX) -> Path:
+    return input_path.with_name(f"{input_path.stem}{suffix}{input_path.suffix}")
+
+
 def is_generated_crop(path: Path, suffix: str = CROPPED_SUFFIX) -> bool:
     generated_suffixes = tuple(dict.fromkeys((suffix, *GENERATED_IMAGE_SUFFIXES)))
     return path.stem.endswith(generated_suffixes)
@@ -419,15 +431,280 @@ def gl_mask_from_cropped(rgb_crop: np.ndarray) -> np.ndarray:
     loss_mask = cv2.morphologyEx(loss_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
     return loss_mask
 
+def measure_loss_regions(loss_mask: np.ndarray, mm_per_px: float):
+    """
+    Label the loss mask and measure every connected component.
+
+    Returns (labeled_image, regionprops_list, areas_mm2) so callers can both
+    aggregate the areas and draw them back onto the image.
+    """
+    labeled = label(loss_mask)
+    props = regionprops(labeled)
+    areas_px = np.array([p.area for p in props], dtype=float)
+    areas_mm2 = (areas_px * (mm_per_px ** 2)) if areas_px.size else np.array([], dtype=float)
+    return labeled, props, areas_mm2
+
+
 def areas_mm2_from_mask(loss_mask: np.ndarray, mm_per_px: float) -> np.ndarray:
     """
     Convert connected-component areas (in pixels) from the loss mask to mm²,
     using the given mm_per_px scale factor.
     """
-    labeled = label(loss_mask)
-    props = regionprops(labeled)
-    areas_px = np.array([p.area for p in props], dtype=float)
-    return (areas_px * (mm_per_px ** 2)) if areas_px.size else np.array([], dtype=float)
+    _, _, areas_mm2 = measure_loss_regions(loss_mask, mm_per_px)
+    return areas_mm2
+
+
+# -----------------------------
+# Annotated ("analysed") image rendering
+# -----------------------------
+class _LabelPlacer:
+    """Coarse occupancy grid so area labels do not print on top of each other."""
+
+    def __init__(self, height: int, width: int, cell: int = 4):
+        self.height = height
+        self.width = width
+        self.cell = max(1, cell)
+        self.grid = np.zeros((height // self.cell + 1, width // self.cell + 1), dtype=bool)
+
+    def _slices(self, x: int, y: int, w: int, h: int):
+        c = self.cell
+        return (
+            slice(y // c, min(self.grid.shape[0], (y + h) // c + 1)),
+            slice(x // c, min(self.grid.shape[1], (x + w) // c + 1)),
+        )
+
+    def reserve(self, x: int, y: int, w: int, h: int) -> bool:
+        """Claim the box if it is inside the image and still free."""
+        if x < 0 or y < 0 or x + w > self.width or y + h > self.height:
+            return False
+        rows, cols = self._slices(x, y, w, h)
+        if self.grid[rows, cols].any():
+            return False
+        self.grid[rows, cols] = True
+        return True
+
+
+def _format_area(area_mm2: float) -> str:
+    if area_mm2 >= 10:
+        return f"{area_mm2:.1f}"
+    if area_mm2 >= 0.1:
+        return f"{area_mm2:.2f}"
+    return f"{area_mm2:.3f}"
+
+
+def _draw_text(img, text, org, font_scale, color, thickness, font=cv2.FONT_HERSHEY_SIMPLEX):
+    """Draw text with a white halo so it stays readable over granules."""
+    cv2.putText(img, text, org, font, font_scale, (255, 255, 255), thickness + 2, cv2.LINE_AA)
+    cv2.putText(img, text, org, font, font_scale, color, thickness, cv2.LINE_AA)
+
+
+def _draw_label_chip(img, text, box, text_baseline, font_scale, color, thickness):
+    """
+    Draw an area label as a white chip with a coloured border and text.
+
+    A filled chip keeps the number readable over both dark loss regions and
+    speckled granule texture.
+    """
+    x, y, box_w, box_h = box
+    cv2.rectangle(img, (x, y), (x + box_w, y + box_h), (255, 255, 255), -1)
+    cv2.rectangle(img, (x, y), (x + box_w, y + box_h), color, max(1, thickness - 1))
+    cv2.putText(
+        img, text, (x + 2, y + text_baseline), cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale, color, thickness, cv2.LINE_AA,
+    )
+
+
+def _draw_scale_reference(img, mm_per_px: float, font_scale: float, thickness: int) -> None:
+    """Draw a mm reference bar in the bottom-left corner of the annotated image."""
+    if not np.isfinite(mm_per_px) or mm_per_px <= 0:
+        return
+
+    h, w = img.shape[:2]
+    max_px = 0.25 * w
+    bar_mm = None
+    for candidate in SCALE_BAR_CANDIDATES_MM:
+        if candidate / mm_per_px <= max_px:
+            bar_mm = candidate
+    if bar_mm is None:
+        return
+
+    bar_px = int(round(bar_mm / mm_per_px))
+    bar_h = max(3, int(round(h * 0.006)))
+    x1 = int(round(w * 0.02))
+    y2 = h - int(round(h * 0.03))
+    y1 = y2 - bar_h
+
+    cv2.rectangle(img, (x1 - 4, y1 - 4), (x1 + bar_px + 4, y2 + 4), (255, 255, 255), -1)
+    cv2.rectangle(img, (x1, y1), (x1 + bar_px, y2), (20, 20, 20), -1)
+    _draw_text(img, f"{bar_mm} mm", (x1, y1 - 6), font_scale, (20, 20, 20), thickness)
+
+
+def _draw_banner(img, lines: list[str], font_scale: float, thickness: int) -> np.ndarray:
+    """Prepend a white header strip carrying the per-image totals."""
+    if not lines:
+        return img
+
+    line_h = int(round(28 * font_scale / 0.6))
+    pad = max(6, line_h // 3)
+    banner_h = pad * 2 + line_h * len(lines)
+    banner = np.full((banner_h, img.shape[1], 3), 255, dtype=np.uint8)
+
+    y = pad + int(line_h * 0.75)
+    for index, line in enumerate(lines):
+        color = (20, 20, 20) if index == 0 else (60, 60, 60)
+        cv2.putText(
+            banner, line, (pad, y), cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale, color, thickness, cv2.LINE_AA,
+        )
+        y += line_h
+
+    cv2.line(banner, (0, banner_h - 1), (img.shape[1], banner_h - 1), (200, 200, 200), 1)
+    return np.vstack([banner, img])
+
+
+def render_loss_annotation(
+    rgb: np.ndarray,
+    labeled: np.ndarray,
+    props,
+    areas_mm2: np.ndarray,
+    mm_per_px: float,
+    igl_cutoff_mm2: float,
+    title: str = "",
+) -> tuple[np.ndarray, list[dict], int]:
+    """
+    Draw every detected loss region on a copy of the analysed image.
+
+    Each region is tinted and outlined (blue = IGL, red = PGL) and labelled with
+    its area in mm² whenever a label fits without overlapping another one.
+
+    Returns (annotated_rgb, region_records, labelled_count).
+    """
+    h, w = rgb.shape[:2]
+    font_scale = max(0.34, min(1.1, w / 1700.0))
+    thickness = max(1, int(round(w / 1400.0)))
+    outline_thickness = max(1, int(round(w / 1200.0)))
+
+    is_pgl = areas_mm2 >= igl_cutoff_mm2 if areas_mm2.size else np.array([], dtype=bool)
+
+    # Tint the two classes, then outline them.
+    canvas = rgb.astype(np.float32)
+    for selector, color in ((~is_pgl, IGL_COLOR), (is_pgl, PGL_COLOR)):
+        if not selector.any():
+            continue
+        ids = [prop.label for prop, keep in zip(props, selector) if keep]
+        class_mask = np.isin(labeled, ids)
+        tint = np.array(color, dtype=np.float32)
+        canvas[class_mask] = (
+            (1.0 - ANNOTATION_FILL_ALPHA) * canvas[class_mask] + ANNOTATION_FILL_ALPHA * tint
+        )
+    annotated = canvas.astype(np.uint8)
+
+    for selector, color in ((~is_pgl, IGL_COLOR), (is_pgl, PGL_COLOR)):
+        if not selector.any():
+            continue
+        ids = [prop.label for prop, keep in zip(props, selector) if keep]
+        class_mask = np.isin(labeled, ids).astype(np.uint8)
+        contours, _ = cv2.findContours(class_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(annotated, contours, -1, color, outline_thickness, cv2.LINE_AA)
+
+    # Label the largest regions first so the important numbers always land.
+    placer = _LabelPlacer(h, w, cell=max(2, int(round(w / 400.0))))
+    order = np.argsort(-areas_mm2) if areas_mm2.size else np.array([], dtype=int)
+
+    records: list[dict] = []
+    labelled = 0
+    for position in order:
+        prop = props[position]
+        area_mm2 = float(areas_mm2[position])
+        pgl = bool(is_pgl[position])
+        color = PGL_COLOR if pgl else IGL_COLOR
+        text = _format_area(area_mm2)
+
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+        )
+        box_w, box_h = text_w + 4, text_h + baseline + 4
+
+        min_row, min_col, max_row, max_col = prop.bbox
+        centroid_y, centroid_x = prop.centroid
+        inside = (
+            (int(centroid_x - box_w / 2), int(centroid_y - box_h / 2)),
+        ) if (max_col - min_col >= box_w + 4 and max_row - min_row >= box_h + 4) else ()
+        candidates = (
+            *inside,                                                      # only when it fits
+            (int(centroid_x - box_w / 2), int(min_row - box_h - 3)),       # above
+            (int(centroid_x - box_w / 2), int(max_row + 3)),               # below
+            (int(max_col + 4), int(centroid_y - box_h / 2)),               # right
+            (int(min_col - box_w - 4), int(centroid_y - box_h / 2)),       # left
+        )
+
+        placed = False
+        if prop.area >= ANNOTATION_MIN_LABEL_AREA_PX:
+            for x, y in candidates:
+                if placer.reserve(x, y, box_w, box_h):
+                    _draw_label_chip(
+                        annotated, text, (x, y, box_w, box_h), text_h + 2,
+                        font_scale, color, thickness,
+                    )
+                    placed = True
+                    labelled += 1
+                    break
+
+        records.append({
+            "Region_ID": int(prop.label),
+            "Class": "PGL" if pgl else "IGL",
+            "Area_px": int(prop.area),
+            "Area_mm2": area_mm2,
+            "Centroid_X": float(centroid_x),
+            "Centroid_Y": float(centroid_y),
+            "Labelled_On_Image": placed,
+        })
+
+    _draw_scale_reference(annotated, mm_per_px, font_scale, thickness)
+
+    igl_areas = areas_mm2[~is_pgl] if areas_mm2.size else np.array([])
+    pgl_areas = areas_mm2[is_pgl] if areas_mm2.size else np.array([])
+    lines = [
+        f"{title}  |  regions: {areas_mm2.size}  |  cutoff: {igl_cutoff_mm2:g} mm2"
+        f"  |  mm/px: {mm_per_px:.5f}",
+        f"IGL (< {igl_cutoff_mm2:g} mm2, blue): n={igl_areas.size}, "
+        f"sum={float(np.sum(igl_areas)) if igl_areas.size else 0.0:.3f} mm2   "
+        f"PGL (>= {igl_cutoff_mm2:g} mm2, red): n={pgl_areas.size}, "
+        f"sum={float(np.sum(pgl_areas)) if pgl_areas.size else 0.0:.3f} mm2",
+        f"Total loss area: {float(np.sum(areas_mm2)) if areas_mm2.size else 0.0:.3f} mm2   "
+        f"labelled {labelled}/{areas_mm2.size} regions "
+        f"(unlabelled ones are outlined; all areas are in granule_loss_regions.csv)",
+    ]
+    annotated = _draw_banner(annotated, lines, font_scale, thickness)
+
+    # Records are sorted largest-first above; keep them in label order on disk.
+    records.sort(key=lambda record: record["Region_ID"])
+    return annotated, records, labelled
+
+
+def save_loss_annotation(
+    rgb: np.ndarray,
+    labeled: np.ndarray,
+    props,
+    areas_mm2: np.ndarray,
+    mm_per_px: float,
+    igl_cutoff_mm2: float,
+    output_path: Path,
+    title: str = "",
+) -> tuple[list[dict], int]:
+    """Render and write the annotated analysis image beside the source image."""
+    annotated, records, labelled = render_loss_annotation(
+        rgb=rgb,
+        labeled=labeled,
+        props=props,
+        areas_mm2=areas_mm2,
+        mm_per_px=mm_per_px,
+        igl_cutoff_mm2=igl_cutoff_mm2,
+        title=title,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(annotated).save(output_path)
+    return records, labelled
 
 def plot_pdf_panel(ax, data: np.ndarray, label_str: str, color: str):
     """
@@ -513,6 +790,7 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
         )
 
     rows = []
+    region_rows = []
     pooled_igl, pooled_pgl, pooled_all = [], [], []
 
     for index, row_data in image_pairs_df.iterrows():
@@ -539,11 +817,34 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
         loss_mask = gl_mask_from_cropped(rgb_crop)
 
         # 3) region areas in mm²
-        areas = areas_mm2_from_mask(loss_mask, mm_per_px_orig)
+        labeled, props, areas = measure_loss_regions(loss_mask, mm_per_px_orig)
 
         # 4) split by IGL vs PGL threshold
         igl = areas[areas < igl_cutoff_mm2]
         pgl = areas[areas >= igl_cutoff_mm2]
+
+        # 4b) annotated ("analysed") image beside the source, one per input image
+        annotated_path = annotated_output_path(p_orig)
+        try:
+            records, labelled_count = save_loss_annotation(
+                rgb=rgb_crop,
+                labeled=labeled,
+                props=props,
+                areas_mm2=areas,
+                mm_per_px=mm_per_px_orig,
+                igl_cutoff_mm2=igl_cutoff_mm2,
+                output_path=annotated_path,
+                title=impact_name,
+            )
+            for record in records:
+                region_rows.append({"Impact": impact_name, **record})
+            log(
+                f"  - {impact_name}: annotated -> {annotated_path.name} | "
+                f"labelled {labelled_count}/{areas.size} region(s)"
+            )
+        except Exception as e:
+            log(f"[{impact_name}] Could not write annotated image: {e}")
+            annotated_path = None
 
         # 5) per-region severity arrays (kept as-is; not used for totals-based scores)
         sev_igl = compute_severity_from_percentiles(igl)
@@ -563,10 +864,13 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
             "Impact": impact_name,
             "Original_Image": str(p_orig),
             "Cropped_Image": str(p_crop),
+            "Annotated_Image": str(annotated_path) if annotated_path is not None else "",
             "Count_IGL": int(igl.size),
             "Count_PGL": int(pgl.size),
+            "Count_All": int(areas.size),
             "AreaSum_IGL_mm2": float(np.sum(igl)) if igl.size else 0.0,
             "AreaSum_PGL_mm2": float(np.sum(pgl)) if pgl.size else 0.0,
+            "AreaSum_All_mm2": float(np.sum(areas)) if areas.size else 0.0,
             "MeanSev_IGL": float(mean_igl_sev) if np.isfinite(mean_igl_sev) else np.nan,
             "MeanSev_PGL": float(mean_pgl_sev) if np.isfinite(mean_pgl_sev) else np.nan,
             "GL_Score": float(gl_score) if np.isfinite(gl_score) else np.nan,
@@ -658,6 +962,19 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
     csv_path = output_path / "granule_loss_results.csv"
     summary_df.to_csv(str(csv_path), index=False)
     log(f"Saved CSV to: {csv_path}")
+
+    # Every measured region (incl. the ones too small to label on the image)
+    regions_df = pd.DataFrame(
+        region_rows,
+        columns=[
+            "Impact", "Region_ID", "Class", "Area_px", "Area_mm2",
+            "Centroid_X", "Centroid_Y", "Labelled_On_Image",
+        ],
+    )
+    regions_csv_path = output_path / "granule_loss_regions.csv"
+    regions_df.to_csv(str(regions_csv_path), index=False)
+    log(f"Saved per-region CSV to: {regions_csv_path}")
+    log(f"Annotated images saved beside each source image as *{ANNOTATED_SUFFIX}.*")
 
     return summary_df, fig
 
