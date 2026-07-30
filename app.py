@@ -8,6 +8,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from loss import process_granule_loss
 
+SCALE_AUTO = "Auto-detect"
+SCALE_CHOICES = (SCALE_AUTO, "10 mm", "20 mm")
+
 
 class GranuleLossApp:
     def __init__(self, root):
@@ -20,6 +23,7 @@ class GranuleLossApp:
         self.input_folder_var = tk.StringVar()
         self.output_folder_var = tk.StringVar()
         self.threshold_var = tk.StringVar(value="2.58")
+        self.scale_var = tk.StringVar(value=SCALE_AUTO)
         self.status_var = tk.StringVar(value="Ready")
 
         # Track if processing is running
@@ -89,6 +93,24 @@ class GranuleLossApp:
             row=0, column=3, sticky=tk.W, padx=(16, 0)
         )
 
+        ttk.Label(settings_frame, text="Scale bar length", style='Section.TLabel').grid(
+            row=1, column=0, sticky=tk.W, pady=(8, 0)
+        )
+        ttk.Combobox(
+            settings_frame,
+            textvariable=self.scale_var,
+            values=SCALE_CHOICES,
+            state="readonly",
+            width=12,
+        ).grid(row=1, column=1, sticky=tk.W, padx=(8, 4), pady=(8, 0))
+        ttk.Label(
+            settings_frame,
+            text=(
+                "Auto reads the mm label printed next to each bar; a '10mm'/'20mm' file-name "
+                "tag overrides it. Set a value here to force it for every image."
+            ),
+        ).grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
+
         action_frame = ttk.Frame(main_frame)
         action_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         action_frame.columnconfigure(1, weight=1)
@@ -130,6 +152,8 @@ class GranuleLossApp:
             "AreaSum_All_mm2",
             "GL_Rating",
             "CombinedGL_Rating",
+            "ScaleBar_mm",
+            "Scale_Source",
         )
         self.summary_tree = ttk.Treeview(summary_frame, columns=columns, show="headings", height=12)
         for column in columns:
@@ -165,6 +189,13 @@ class GranuleLossApp:
         """Internal method to append to log (must be called from main thread)."""
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
+
+    def selected_scale_mm(self):
+        """Return the forced scale-bar length in mm, or None when auto-detecting."""
+        choice = self.scale_var.get()
+        if choice == SCALE_AUTO:
+            return None
+        return float(choice.split()[0])
 
     def validate_inputs(self):
         """Validate user inputs before running analysis."""
@@ -230,11 +261,17 @@ class GranuleLossApp:
             input_folder = self.input_folder_var.get()
             output_folder = self.output_folder_var.get()
             threshold = float(self.threshold_var.get())
+            forced_scale_mm = self.selected_scale_mm()
 
             self.log_message(f"\nInput Folder: {input_folder}")
             self.log_message(f"Output Folder: {output_folder}")
-            self.log_message(f"IGL/PGL Threshold: {threshold} mm2\n")
-            self.log_message("Cropped images will be saved beside each source as *_cropped.*")
+            self.log_message(f"IGL/PGL Threshold: {threshold} mm2")
+            self.log_message(
+                f"Scale bar: {'forced to %g mm for every image' % forced_scale_mm}"
+                if forced_scale_mm
+                else "Scale bar: auto-detected per image (file-name tag, then printed label)"
+            )
+            self.log_message("\nCropped images will be saved beside each source as *_cropped.*")
             self.log_message("Annotated images with per-spot areas will be saved as *_annotated.*\n")
 
             # Run the analysis
@@ -242,7 +279,8 @@ class GranuleLossApp:
                 input_folder=input_folder,
                 output_folder=output_folder,
                 igl_cutoff_mm2=threshold,
-                log_callback=self.log_message
+                log_callback=self.log_message,
+                forced_scale_mm=forced_scale_mm,
             )
 
             self.root.after(0, self._display_summary, summary_df)
@@ -252,9 +290,20 @@ class GranuleLossApp:
             self.log_message("Analysis completed successfully!")
             self.log_message("=" * 70)
 
-            # Show success message
-            self.root.after(0, messagebox.showinfo, "Success",
-                          f"Analysis completed!\n\nResults saved to:\n{output_folder}")
+            # Show success message, calling out any image whose scale is a guess
+            message = f"Analysis completed!\n\nResults saved to:\n{output_folder}"
+            if "Scale_Verified" in summary_df.columns:
+                unverified = summary_df.loc[~summary_df["Scale_Verified"].astype(bool), "Impact"]
+                if len(unverified):
+                    message += (
+                        f"\n\nWARNING: the scale bar length could not be verified for "
+                        f"{len(unverified)} of {len(summary_df)} image(s):\n"
+                        f"{', '.join(map(str, unverified[:8]))}"
+                        f"{' ...' if len(unverified) > 8 else ''}\n\n"
+                        "Their areas may be wrong by 4x. Set 'Scale bar length' explicitly "
+                        "and re-run, or tag those file names with '10mm'/'20mm'."
+                    )
+            self.root.after(0, messagebox.showinfo, "Success", message)
 
         except Exception as e:
             error_msg = f"Error during analysis: {str(e)}"

@@ -1,4 +1,3 @@
-import warnings
 from collections import deque
 from pathlib import Path
 
@@ -32,12 +31,24 @@ ANNOTATED_SUFFIX = "_annotated"
 GENERATED_IMAGE_SUFFIXES = (CROPPED_SUFFIX, ANNOTATED_SUFFIX, "_cleaned")
 IGNORED_OUTPUT_FILENAMES = {"granule_loss_plot.png"}
 
+# Scale-bar length detection
+SCALE_BAR_CANDIDATES_MM = (10, 20)  # bar lengths the label reader resolves
+DEFAULT_SCALE_BAR_MM = 20           # last-resort assumption; always logged as unverified
+# w(first digit) / w("0"), measured on the label's own glyphs so the comparison is
+# font-normalised. Measured over 33 system fonts: a "1" never exceeds 0.944 (fonts
+# whose "1" carries a foot serif -- Times, Courier, Tahoma, DejaVu -- sit high), and
+# a "2" never drops below 0.883. The band between the constants below therefore
+# covers the whole overlap, and ratios landing in it are reported as unresolved
+# rather than guessed: a silently wrong bar length would scale every area by 4x.
+DIGIT_RATIO_ONE_MAX = 0.82
+DIGIT_RATIO_TWO_MIN = 0.95
+
 # Annotated (analysed) image rendering
 IGL_COLOR = (0, 110, 230)          # RGB, blue: individual granule loss (< cutoff)
 PGL_COLOR = (225, 35, 35)          # RGB, red: path granule loss (>= cutoff)
+WARN_COLOR = (200, 90, 0)          # RGB, amber: unverified-scale warnings
 ANNOTATION_FILL_ALPHA = 0.32       # tint strength over each detected loss region
 ANNOTATION_MIN_LABEL_AREA_PX = 10  # regions smaller than this are outlined but not labelled
-SCALE_BAR_CANDIDATES_MM = (1, 2, 5, 10, 20, 50, 100)
 
 # -----------------------------
 # Utilities
@@ -358,57 +369,324 @@ def generate_image_pairs(
 
 
 # ------------------------------------------------------------
-# Robust mm/px from ORIGINAL image (uses your detect_scale_mm)
+# Scale bar: find it, measure it, and read its mm label
 # ------------------------------------------------------------
-def compute_scale_mm_per_px(img_path: Path) -> float:
+def find_scale_bar(rgb: np.ndarray) -> dict | None:
     """
-    Detect the red scale bar in an ORIGINAL image and return mm/px.
-    Uses HSV + morphology + minAreaRect for a robust pixel length, then
-    calls your detect_scale_mm() to decide 10 mm vs 20 mm.
-    """
-    rgb = _read_rgb(img_path)
+    Locate the red scale bar and measure its length in pixels.
 
-    # --- robust red mask in HSV (two hue ranges because red wraps) ---
+    Returns a dict with the bounding box and the minAreaRect long side, or None
+    when no red bar can be found.
+    """
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    # lower/upper bounds: adjust S,V from 80 if your bar is dimmer/brighter
-    low1, high1 = (0, 80, 80), (10, 255, 255)
-    # lower sensitivity
-    low2, high2 = (170, 80, 80), (180, 255, 255)
-    # low1, high1 = (0, 70, 50), (10, 255, 255)
-    # low2, high2 = (170, 70, 50), (180, 255, 255)
-    mask = cv2.inRange(hsv, np.array(low1), np.array(high1)) | \
-           cv2.inRange(hsv, np.array(low2), np.array(high2))
+    # Two hue ranges because red wraps around the hue circle.
+    mask = cv2.inRange(hsv, np.array((0, 80, 80)), np.array((10, 255, 255))) | \
+           cv2.inRange(hsv, np.array((170, 80, 80)), np.array((180, 255, 255)))
 
+    bar = None
     for iters in (2, 1):
-        if iters == 1:
-            print("Struggle in finding red scale bar, try with lower sensitivity:")
-        mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=iters)
+        mask_clean = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=iters
+        )
         n_labels, labels = cv2.connectedComponents(mask_clean)
         if n_labels > 1:
+            areas = [(labels == i).sum() for i in range(1, n_labels)]
+            bar = labels == (1 + int(np.argmax(areas)))
             break
-    else:
-        raise ValueError(f"No red scale bar detected in {img_path}")
 
-    areas = [(labels == i).sum() for i in range(1, n_labels)]
-    i_max = 1 + int(np.argmax(areas))
-    bar = (labels == i_max)
+    if bar is None or not bar.any():
+        return None
 
-    # Measure bar length along its major axis using minAreaRect
-    ys, xs = np.where(bar)
+    ys, xs = np.nonzero(bar)
     pts = np.column_stack([xs, ys]).astype(np.float32)
     (_, _), (w, h), _ = cv2.minAreaRect(pts)
-    long_side_px = max(w, h)
-    if long_side_px <= 0:
-        raise ValueError(f"Detected scale bar has zero length in {img_path}")
+    length_px = float(max(w, h))
+    if length_px <= 0:
+        return None
 
-    # Decide 10 vs 20 mm
-    bar_mm = detect_scale_mm(str(img_path))
-    if bar_mm is None:
-        # If your detector fails, assume 20 mm
-        warnings.warn(f"[{img_path.name}] detect_scale_mm() failed; assuming 20 mm bar.")
-        bar_mm = 20
+    return {
+        "length_px": length_px,
+        "x1": int(xs.min()), "x2": int(xs.max()),
+        "y1": int(ys.min()), "y2": int(ys.max()),
+    }
 
-    return float(bar_mm) / float(long_side_px)
+
+def _label_line_bbox(ink: np.ndarray, bar_len: float) -> tuple[int, int, int, int] | None:
+    """
+    Group ink components into text lines and return the line that most likely
+    holds the scale label (text-shaped, close to the bar).
+    """
+    n, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+    comps = []
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i][:5])
+        if area < 12 or h < 0.04 * bar_len or h > 0.35 * bar_len or w > 1.6 * bar_len:
+            continue  # noise, loss blobs, image borders
+        comps.append((x, y, w, h))
+    if not comps:
+        return None
+
+    # Greedily group components that share a horizontal band -> one text line.
+    comps.sort(key=lambda c: c[1] + c[3] / 2.0)
+    median_h = float(np.median([c[3] for c in comps]))
+    lines: list[list[tuple[int, int, int, int]]] = []
+    for comp in comps:
+        center = comp[1] + comp[3] / 2.0
+        for line in lines:
+            line_center = float(np.mean([c[1] + c[3] / 2.0 for c in line]))
+            if abs(center - line_center) <= max(4.0, 0.6 * median_h):
+                line.append(comp)
+                break
+        else:
+            lines.append([comp])
+
+    best = None
+    for line in lines:
+        x1 = min(c[0] for c in line)
+        y1 = min(c[1] for c in line)
+        x2 = max(c[0] + c[2] for c in line)
+        y2 = max(c[1] + c[3] for c in line)
+        width, height = x2 - x1, y2 - y1
+        if height <= 0 or not (1.2 <= width / height <= 8.0):
+            continue  # a scale label is a short wide string
+        # Prefer the text line closest to the bottom of the search box (the bar).
+        score = y2
+        if best is None or score > best[0]:
+            best = (score, (x1, y1, x2, y2))
+    return best[1] if best else None
+
+
+def _glyph_box_candidates(ink: np.ndarray) -> list[list[tuple[int, int, int, int]]]:
+    """
+    Decompose a cropped label into per-glyph boxes, left to right.
+
+    Two annotation styles occur in practice: plain dark text, where each glyph is
+    its own ink component, and outlined/stroked text, where the glyph bodies touch
+    and merge into one component but each body survives as an enclosed hole. Both
+    decompositions are returned; the caller keeps whichever one validates.
+    """
+    height, width = ink.shape
+    min_area = max(8, 0.004 * height * width)
+
+    def _clean(boxes):
+        if not boxes:
+            return []
+        tallest = max(b[3] for b in boxes)
+        boxes = [b for b in boxes if b[3] >= 0.45 * tallest and b[2] >= 2]
+
+        def nested(box):
+            # A glyph counter (the hole in "0") shows up as its own component
+            # inside the glyph it belongs to; it is not a glyph of its own.
+            return any(
+                other is not box
+                and other[0] <= box[0] and other[1] <= box[1]
+                and other[0] + other[2] >= box[0] + box[2]
+                and other[1] + other[3] >= box[1] + box[3]
+                for other in boxes
+            )
+
+        return sorted((b for b in boxes if not nested(b)), key=lambda b: b[0])
+
+    # Strategy A: ink components (plain text)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+    direct = _clean([
+        tuple(int(v) for v in stats[i][:4])
+        for i in range(1, n) if stats[i][4] >= min_area
+    ])
+
+    # Strategy B: enclosed holes (outlined text) -> the glyph bodies
+    n, _, stats, _ = cv2.connectedComponentsWithStats((~ink).astype(np.uint8), 4)
+    pockets = _clean([
+        tuple(int(v) for v in stats[i][:4])
+        for i in range(1, n)
+        if stats[i][4] >= min_area
+        and stats[i][0] > 0 and stats[i][1] > 0
+        and stats[i][0] + stats[i][2] < width      # touching the crop border means
+        and stats[i][1] + stats[i][3] < height     # background, not a glyph body
+    ])
+
+    return [boxes for boxes in (direct, pockets) if len(boxes) >= 4]
+
+
+def _match_digit_mm_glyphs(glyphs: list[tuple[int, int, int, int]]):
+    """
+    Find a ``<digit><digit>mm`` run inside a list of glyph boxes.
+
+    Validating the whole four-glyph signature — two cap-height digits followed by
+    two matching, wider, x-height ``m`` glyphs — is what keeps the reader from
+    accidentally measuring the two ``m`` glyphs against each other (they have equal
+    widths, which would always look like a "2").
+
+    Returns (first_digit_width, zero_width, cap_height) or None.
+    """
+    for i in range(len(glyphs) - 3):
+        d1, d2, m1, m2 = glyphs[i:i + 4]
+        cap = max(d1[3], d2[3])
+        if cap <= 0 or min(d1[3], d2[3]) < 0.88 * cap:
+            continue                                        # digits share cap height
+        if not all(0.5 * cap <= m[3] <= 0.92 * cap for m in (m1, m2)):
+            continue                                        # m sits at x-height
+        if abs(m1[3] - m2[3]) > 0.18 * cap:
+            continue                                        # the two m's match...
+        if abs(m1[2] - m2[2]) > 0.22 * max(m1[2], m2[2]):
+            continue
+        if min(m1[2], m2[2]) <= 0.9 * d2[2]:
+            continue                                        # ...and m is wider than a digit
+        gaps = [b[0] - (a[0] + a[2]) for a, b in zip((d1, d2, m1), (d2, m1, m2))]
+        if any(gap > 0.9 * cap or gap < -0.25 * cap for gap in gaps):
+            continue                                        # one tight run, not stray blobs
+        if d2[2] <= 0:
+            continue
+        return d1[2], d2[2], cap
+    return None
+
+
+def read_scale_label_mm(rgb: np.ndarray, bar: dict) -> tuple[int | None, dict]:
+    """
+    Read the "10mm"/"20mm" label printed next to the scale bar.
+
+    The two candidates differ only in their first digit, so the first digit's ink
+    width is compared against the "0" next to it. Using the label's own glyphs
+    keeps the test independent of the font, size and stroke style. Returns
+    (mm or None, info) where info explains the decision.
+    """
+    height, width = rgb.shape[:2]
+    bar_len = bar["length_px"]
+    info: dict[str, object] = {"reason": "label not found"}
+
+    x1 = max(0, int(bar["x1"] - 0.6 * bar_len))
+    x2 = min(width, int(bar["x2"] + 0.6 * bar_len) + 1)
+    y1 = max(0, int(bar["y1"] - 1.4 * bar_len))
+    y2 = min(height, int(bar["y2"] + 0.4 * bar_len) + 1)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None, info
+
+    box = rgb[y1:y2, x1:x2]
+    gray = luminance(box)
+    # Blank the bar rows so the red bar itself is never mistaken for text.
+    bar_rows = slice(max(0, bar["y1"] - y1 - 2), max(0, bar["y2"] - y1 + 3))
+
+    for ink_threshold in (120, 160, 90):
+        ink = gray <= ink_threshold
+        ink[bar_rows, :] = False
+        line = _label_line_bbox(ink, bar_len)
+        if line is None:
+            continue
+
+        lx1, ly1, lx2, ly2 = line
+        matched = None
+        for glyphs in _glyph_box_candidates(ink[ly1:ly2, lx1:lx2]):
+            matched = _match_digit_mm_glyphs(glyphs)
+            if matched is not None:
+                break
+        if matched is None:
+            info = {
+                "reason": "could not resolve a '<digit><digit>mm' label next to the bar",
+                "ink_threshold": ink_threshold,
+            }
+            continue
+
+        first_w, zero_w, cap = matched
+        ratio = first_w / zero_w
+        info = {
+            "ink_threshold": ink_threshold,
+            "digit_width_ratio": round(float(ratio), 3),
+            "label_box": (x1 + lx1, y1 + ly1, x1 + lx2, y1 + ly2),
+            "text_height_px": int(cap),
+        }
+        if ratio <= DIGIT_RATIO_ONE_MAX:
+            info["reason"] = f"first digit is narrow (w/w0={ratio:.2f}) -> '1'"
+            return 10, info
+        if ratio >= DIGIT_RATIO_TWO_MIN:
+            info["reason"] = f"first digit is wide (w/w0={ratio:.2f}) -> '2'"
+            return 20, info
+        info["reason"] = (
+            f"first-digit width ratio {ratio:.2f} falls in the ambiguous band "
+            f"({DIGIT_RATIO_ONE_MAX}-{DIGIT_RATIO_TWO_MIN})"
+        )
+        return None, info
+
+    return None, info
+
+
+def scale_mm_from_filename(image_path: Path) -> int | None:
+    """Read an explicit ``10mm`` / ``20mm`` tag out of the file name, if present."""
+    stem = image_path.stem.lower().replace(" ", "")
+    for candidate in SCALE_BAR_CANDIDATES_MM:
+        if f"{candidate}mm" in stem:
+            return int(candidate)
+    return None
+
+
+def measure_scale(
+    img_path: Path,
+    rgb: np.ndarray | None = None,
+    forced_mm: float | None = None,
+    log=None,
+) -> dict:
+    """
+    Work out mm/px for an ORIGINAL image and report how the bar length was decided.
+
+    Resolution order: explicit override -> ``10mm``/``20mm`` file-name tag ->
+    the printed label next to the bar -> the legacy width-fraction guess ->
+    ``DEFAULT_SCALE_BAR_MM``. Only the first three are treated as trustworthy;
+    the rest are flagged so a wrong scale cannot pass unnoticed.
+    """
+    def emit(message):
+        if log:
+            log(message)
+
+    if rgb is None:
+        rgb = _read_rgb(img_path)
+
+    bar = find_scale_bar(rgb)
+    if bar is None:
+        raise ValueError(f"No red scale bar detected in {img_path}")
+
+    bar_px = bar["length_px"]
+    label_info: dict[str, object] = {}
+
+    if forced_mm:
+        bar_mm, source, confident = float(forced_mm), "forced", True
+    elif (tagged := scale_mm_from_filename(img_path)) is not None:
+        bar_mm, source, confident = float(tagged), "filename", True
+        emit(f"      scale from file name tag: {tagged} mm")
+    else:
+        read_mm, label_info = read_scale_label_mm(rgb, bar)
+        if read_mm is not None:
+            bar_mm, source, confident = float(read_mm), "label", True
+            emit(f"      scale read from label: {read_mm} mm ({label_info.get('reason')})")
+        else:
+            guess = detect_scale_mm(str(img_path))
+            if guess is not None:
+                bar_mm, source, confident = float(guess), "width-heuristic", False
+                emit(
+                    f"      WARNING: could not read the scale label "
+                    f"({label_info.get('reason')}); fell back to the bar-width guess "
+                    f"-> {guess:g} mm. Verify this image, use the scale-bar override, "
+                    f"or add a '10mm'/'20mm' tag to the file name."
+                )
+            else:
+                bar_mm, source, confident = float(DEFAULT_SCALE_BAR_MM), "default", False
+                emit(
+                    f"      WARNING: no scale label and no bar-width guess; assuming "
+                    f"{DEFAULT_SCALE_BAR_MM} mm. Areas for this image may be wrong."
+                )
+
+    return {
+        "mm_per_px": bar_mm / bar_px,
+        "bar_mm": bar_mm,
+        "bar_px": bar_px,
+        "bar_box": (bar["x1"], bar["y1"], bar["x2"], bar["y2"]),
+        "source": source,
+        "confident": confident,
+        "label_info": label_info,
+    }
+
+
+def compute_scale_mm_per_px(img_path: Path, forced_mm: float | None = None) -> float:
+    """Detect the red scale bar in an ORIGINAL image and return mm/px."""
+    return measure_scale(img_path, forced_mm=forced_mm)["mm_per_px"]
 
 def gl_mask_from_cropped(rgb_crop: np.ndarray) -> np.ndarray:
     """
@@ -514,33 +792,62 @@ def _draw_label_chip(img, text, box, text_baseline, font_scale, color, thickness
     )
 
 
-def _draw_scale_reference(img, mm_per_px: float, font_scale: float, thickness: int) -> None:
-    """Draw a mm reference bar in the bottom-left corner of the annotated image."""
-    if not np.isfinite(mm_per_px) or mm_per_px <= 0:
+def _draw_scale_reference(img, scale: dict, font_scale: float, thickness: int) -> None:
+    """
+    Redraw the scale bar exactly as it was measured, and mark where it was found.
+
+    The bar is drawn at its detected pixel length and captioned with the mm value
+    that was used, so the calibration behind every area can be checked against the
+    source image at a glance instead of being taken on trust.
+    """
+    bar_px = float(scale.get("bar_px") or 0)
+    bar_mm = float(scale.get("bar_mm") or 0)
+    if bar_px <= 0 or bar_mm <= 0:
         return
 
     h, w = img.shape[:2]
-    max_px = 0.25 * w
-    bar_mm = None
-    for candidate in SCALE_BAR_CANDIDATES_MM:
-        if candidate / mm_per_px <= max_px:
-            bar_mm = candidate
-    if bar_mm is None:
-        return
+    confident = bool(scale.get("confident", True))
+    color = (20, 20, 20) if confident else WARN_COLOR
 
-    bar_px = int(round(bar_mm / mm_per_px))
+    # Show where the bar was detected in the source image (it was erased by cleaning).
+    box = scale.get("bar_box")
+    if box:
+        bx1, by1, bx2, by2 = (int(v) for v in box)
+        pad = max(3, int(round(w * 0.004)))
+        cv2.rectangle(img, (bx1 - pad, by1 - pad), (bx2 + pad, by2 + pad), color, thickness)
+        caption_y = by1 - pad - 4
+        if caption_y > 12:
+            _draw_text(img, "scale bar", (bx1 - pad, caption_y), font_scale * 0.8, color, thickness)
+
+    drawn_px = int(round(min(bar_px, 0.9 * w)))
     bar_h = max(3, int(round(h * 0.006)))
     x1 = int(round(w * 0.02))
     y2 = h - int(round(h * 0.03))
     y1 = y2 - bar_h
 
-    cv2.rectangle(img, (x1 - 4, y1 - 4), (x1 + bar_px + 4, y2 + 4), (255, 255, 255), -1)
-    cv2.rectangle(img, (x1, y1), (x1 + bar_px, y2), (20, 20, 20), -1)
-    _draw_text(img, f"{bar_mm} mm", (x1, y1 - 6), font_scale, (20, 20, 20), thickness)
+    caption = f"{bar_mm:g} mm = {bar_px:.0f} px ({scale.get('source', 'unknown')})"
+    if not confident:
+        caption += " - UNVERIFIED"
+    if drawn_px < bar_px:
+        caption += " [bar shown truncated]"
+    (caption_w, caption_h), _ = cv2.getTextSize(
+        caption, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+    )
+
+    # One white plate behind both the bar and its caption, so neither is lost in the image.
+    plate_x2 = min(w - 1, x1 + max(drawn_px, caption_w) + 4)
+    cv2.rectangle(img, (x1 - 4, y1 - caption_h - 12), (plate_x2, y2 + 4), (255, 255, 255), -1)
+    cv2.rectangle(img, (x1, y1), (x1 + drawn_px, y2), color, -1)
+    _draw_text(img, caption, (x1, y1 - 8), font_scale, color, thickness)
 
 
-def _draw_banner(img, lines: list[str], font_scale: float, thickness: int) -> np.ndarray:
-    """Prepend a white header strip carrying the per-image totals."""
+def _draw_banner(img, lines, font_scale: float, thickness: int) -> np.ndarray:
+    """
+    Prepend a white header strip carrying the per-image totals.
+
+    Each entry is either a string or a (text, colour) pair, so warnings can be
+    called out in a different colour from the ordinary readings.
+    """
     if not lines:
         return img
 
@@ -550,8 +857,10 @@ def _draw_banner(img, lines: list[str], font_scale: float, thickness: int) -> np
     banner = np.full((banner_h, img.shape[1], 3), 255, dtype=np.uint8)
 
     y = pad + int(line_h * 0.75)
-    for index, line in enumerate(lines):
-        color = (20, 20, 20) if index == 0 else (60, 60, 60)
+    for index, entry in enumerate(lines):
+        line, color = entry if isinstance(entry, tuple) else (
+            entry, (20, 20, 20) if index == 0 else (60, 60, 60)
+        )
         cv2.putText(
             banner, line, (pad, y), cv2.FONT_HERSHEY_SIMPLEX,
             font_scale, color, thickness, cv2.LINE_AA,
@@ -567,7 +876,7 @@ def render_loss_annotation(
     labeled: np.ndarray,
     props,
     areas_mm2: np.ndarray,
-    mm_per_px: float,
+    scale: dict,
     igl_cutoff_mm2: float,
     title: str = "",
 ) -> tuple[np.ndarray, list[dict], int]:
@@ -660,13 +969,13 @@ def render_loss_annotation(
             "Labelled_On_Image": placed,
         })
 
-    _draw_scale_reference(annotated, mm_per_px, font_scale, thickness)
+    _draw_scale_reference(annotated, scale, font_scale, thickness)
 
     igl_areas = areas_mm2[~is_pgl] if areas_mm2.size else np.array([])
     pgl_areas = areas_mm2[is_pgl] if areas_mm2.size else np.array([])
+    mm_per_px = float(scale.get("mm_per_px") or 0.0)
     lines = [
-        f"{title}  |  regions: {areas_mm2.size}  |  cutoff: {igl_cutoff_mm2:g} mm2"
-        f"  |  mm/px: {mm_per_px:.5f}",
+        f"{title}  |  regions: {areas_mm2.size}  |  cutoff: {igl_cutoff_mm2:g} mm2",
         f"IGL (< {igl_cutoff_mm2:g} mm2, blue): n={igl_areas.size}, "
         f"sum={float(np.sum(igl_areas)) if igl_areas.size else 0.0:.3f} mm2   "
         f"PGL (>= {igl_cutoff_mm2:g} mm2, red): n={pgl_areas.size}, "
@@ -674,7 +983,16 @@ def render_loss_annotation(
         f"Total loss area: {float(np.sum(areas_mm2)) if areas_mm2.size else 0.0:.3f} mm2   "
         f"labelled {labelled}/{areas_mm2.size} regions "
         f"(unlabelled ones are outlined; all areas are in granule_loss_regions.csv)",
+        f"Scale: {float(scale.get('bar_mm') or 0):g} mm bar = "
+        f"{float(scale.get('bar_px') or 0):.0f} px -> {mm_per_px:.5f} mm/px "
+        f"(from {scale.get('source', 'unknown')})",
     ]
+    if not scale.get("confident", True):
+        lines.append((
+            "WARNING: the bar length could not be read from the image - "
+            "areas are only correct if this bar length is right.",
+            WARN_COLOR,
+        ))
     annotated = _draw_banner(annotated, lines, font_scale, thickness)
 
     # Records are sorted largest-first above; keep them in label order on disk.
@@ -687,7 +1005,7 @@ def save_loss_annotation(
     labeled: np.ndarray,
     props,
     areas_mm2: np.ndarray,
-    mm_per_px: float,
+    scale: dict,
     igl_cutoff_mm2: float,
     output_path: Path,
     title: str = "",
@@ -698,7 +1016,7 @@ def save_loss_annotation(
         labeled=labeled,
         props=props,
         areas_mm2=areas_mm2,
-        mm_per_px=mm_per_px,
+        scale=scale,
         igl_cutoff_mm2=igl_cutoff_mm2,
         title=title,
     )
@@ -758,7 +1076,13 @@ def compute_severity_from_percentiles(data: np.ndarray):
 
 
 
-def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_callback=None):
+def process_granule_loss(
+    input_folder,
+    output_folder,
+    igl_cutoff_mm2=2.58,
+    log_callback=None,
+    forced_scale_mm=None,
+):
     """
     Process granule loss analysis on images in the input folder.
 
@@ -767,6 +1091,9 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
         output_folder (str): Path to save output files
         igl_cutoff_mm2 (float): Threshold for IGL vs PGL classification (default: 2.58)
         log_callback (callable): Optional callback function for logging messages
+        forced_scale_mm (float): Scale-bar length in mm to use for every image.
+            None (default) auto-detects per image: a ``10mm``/``20mm`` file-name tag
+            wins, otherwise the label printed next to the bar is read.
 
     Returns:
         tuple: (summary_df, fig) - DataFrame with results and matplotlib figure
@@ -791,6 +1118,7 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
 
     rows = []
     region_rows = []
+    unverified_scales = []
     pooled_igl, pooled_pgl, pooled_all = [], [], []
 
     for index, row_data in image_pairs_df.iterrows():
@@ -802,15 +1130,23 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
             log(f"[{impact_name}] Skipping pair, ... original ('{p_orig}') or cropped ('{p_crop}') file not found.")
             continue
 
-        # 1) compute mm/px from original
+        # 1) compute mm/px from original, and record how the bar length was decided
         try:
-            mm_per_px_orig = compute_scale_mm_per_px(p_orig)
+            scale = measure_scale(p_orig, forced_mm=forced_scale_mm, log=log)
         except Exception as e:
             log(
-                f"[{impact_name}] Could not compute mm/px from original: {e}. "
-                "Falling back to a crude default assuming a ~20 mm bar spans ~300 px."
+                f"[{impact_name}] WARNING: could not measure the scale bar: {e}. "
+                "Falling back to a crude default assuming a ~20 mm bar spans ~300 px; "
+                "areas for this image are not trustworthy."
             )
-            mm_per_px_orig = 20.0 / 300.0
+            scale = {
+                "mm_per_px": 20.0 / 300.0, "bar_mm": 20.0, "bar_px": 300.0,
+                "bar_box": None, "source": "no-bar-found", "confident": False,
+                "label_info": {},
+            }
+        mm_per_px_orig = scale["mm_per_px"]
+        if not scale["confident"]:
+            unverified_scales.append(impact_name)
 
         # 2) load cropped GL image and segment
         rgb_crop = _read_rgb(p_crop)
@@ -831,7 +1167,7 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
                 labeled=labeled,
                 props=props,
                 areas_mm2=areas,
-                mm_per_px=mm_per_px_orig,
+                scale=scale,
                 igl_cutoff_mm2=igl_cutoff_mm2,
                 output_path=annotated_path,
                 title=impact_name,
@@ -877,7 +1213,11 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
             "GL_Rating": (int(np.clip(np.rint(gl_score), 0, 3)) if np.isfinite(gl_score) else np.nan),
             "CombinedGL_Score": (float(np.mean(np.concatenate([sev_igl, sev_pgl]))) if (sev_igl.size or sev_pgl.size) else np.nan),
             "CombinedGL_Rating": (int(np.clip(np.rint(np.mean(np.concatenate([sev_igl, sev_pgl]))), 0, 3)) if (sev_igl.size or sev_pgl.size) else np.nan),
-            "mm_per_px_original": float(mm_per_px_orig)
+            "mm_per_px_original": float(mm_per_px_orig),
+            "ScaleBar_mm": float(scale["bar_mm"]),
+            "ScaleBar_px": float(scale["bar_px"]),
+            "Scale_Source": scale["source"],
+            "Scale_Verified": bool(scale["confident"]),
         })
 
         pooled_igl.append(igl)
@@ -889,7 +1229,8 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
         amax = float(np.max(areas)) if areas.size else float("nan")
         log(
             f"  - {impact_name}: regions={areas.size:4d}, min/max={amin:.3f}/{amax:.3f} mm², "
-            f"IGL={igl.size}, PGL={pgl.size}, mm/px(orig)={mm_per_px_orig:.5f}"
+            f"IGL={igl.size}, PGL={pgl.size}, mm/px(orig)={mm_per_px_orig:.5f}, "
+            f"scale={scale['bar_mm']:g} mm / {scale['bar_px']:.0f} px ({scale['source']})"
         )
 
     if not rows:
@@ -975,6 +1316,20 @@ def process_granule_loss(input_folder, output_folder, igl_cutoff_mm2=2.58, log_c
     regions_df.to_csv(str(regions_csv_path), index=False)
     log(f"Saved per-region CSV to: {regions_csv_path}")
     log(f"Annotated images saved beside each source image as *{ANNOTATED_SUFFIX}.*")
+
+    if unverified_scales:
+        log(
+            f"\nWARNING: the scale bar length could not be verified for "
+            f"{len(unverified_scales)} of {len(rows)} image(s): "
+            f"{', '.join(unverified_scales[:12])}"
+            f"{' ...' if len(unverified_scales) > 12 else ''}"
+        )
+        log(
+            "  Areas scale with the square of mm/px, so a 10 mm bar read as 20 mm "
+            "makes every area 4x too large. Fix these by setting the scale-bar length "
+            "explicitly, or by adding a '10mm'/'20mm' tag to the file name. "
+            "Check the 'Scale_Verified' column and the header of each annotated image."
+        )
 
     return summary_df, fig
 
