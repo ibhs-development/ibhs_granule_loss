@@ -74,6 +74,9 @@ matter (with `app_file: gradio_app.py`) to the top of the existing `README.md`, 
 - Each run works in its own temp folder, which is deleted when that browser session starts
   the next run or presses **Clear**. Nothing is persisted, so results must be downloaded
   from the app.
-- `GL_Rating` / `CombinedGL_Rating` rank an impact against the other impacts in the same
-  run via percentiles. With a single image they are always `0` and carry no meaning — the
-  UI says so. Use the desktop app over a folder of impacts to get real ratings.
+- `GL_Rating` / `CombinedGL_Rating` / `GL_Score` / `CombinedGL_Score` / `MeanSev_*` rank an
+  impact against the other impacts in the same run via percentiles. With a single image
+  those percentiles collapse, so the web UI hides these columns (`HIDDEN_COLUMNS` in
+  `gradio_app.py`) instead of showing a `0` that reads like a severity. They are still in
+  the downloadable `granule_loss_results.csv`, which is the pipeline's own untouched output.
+  Use the desktop app over a folder of impacts to get real ratings.

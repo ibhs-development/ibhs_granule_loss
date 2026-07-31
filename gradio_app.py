@@ -46,8 +46,10 @@ RESULT_COMPONENTS = 8
 
 # Percentile-based ratings rank an impact against the other impacts in the same
 # run. With a single image the 25/50/75th percentiles collapse onto one value, so
-# these columns carry no information here and must not be read as a severity.
-DATASET_RELATIVE_COLUMNS = (
+# these columns carry no information here and are hidden from the results rather
+# than shown as a severity that could be misread. They stay in the downloaded
+# granule_loss_results.csv, which is the pipeline's own output.
+HIDDEN_COLUMNS = (
     "GL_Score",
     "GL_Rating",
     "CombinedGL_Score",
@@ -169,19 +171,19 @@ def _regions_table(regions_csv: Path) -> pd.DataFrame:
 
 
 def _full_summary_table(summary_df: pd.DataFrame) -> pd.DataFrame:
-    """One-row summary as Field/Value pairs, with dataset-relative columns flagged."""
+    """One-row summary as Field/Value pairs, minus the columns single-image runs cannot fill."""
+    skip = {"Original_Image", "Cropped_Image", "Annotated_Image", *HIDDEN_COLUMNS}
     row = summary_df.iloc[0]
     records = []
     for column in summary_df.columns:
-        if column in ("Original_Image", "Cropped_Image", "Annotated_Image"):
-            continue  # server-side temp paths, meaningless to the user
+        if column in skip:
+            # image paths point at server-side temp files; HIDDEN_COLUMNS are the
+            # percentile ratings, which are meaningless for one image.
+            continue
         value = row[column]
         if isinstance(value, float):
             value = f"{value:.5f}" if column == "mm_per_px_original" else f"{value:.4f}"
-        field = column
-        if column in DATASET_RELATIVE_COLUMNS:
-            field = f"{column} (needs multiple impacts)"
-        records.append({"Field": field, "Value": str(value)})
+        records.append({"Field": column, "Value": str(value)})
     return pd.DataFrame(records, columns=["Field", "Value"])
 
 
@@ -367,10 +369,9 @@ NOTES = """
   are neither drawn nor counted.
 * Every detected region is in the per-region table and CSV, including regions too small or
   too crowded to carry a label on the image.
-* `GL_Rating` / `CombinedGL_Rating` rank an impact against the *other impacts in the same
-  run* using 25/50/75th percentiles. With one image those percentiles collapse, so the
-  ratings are always `0` here and mean nothing — use the desktop app on a folder of impacts
-  to get ratings.
+* Severity ratings are not reported here: they rank an impact against the *other impacts in
+  the same run*, which needs more than one image. Run the desktop app over a folder of
+  impacts to get them.
 """
 
 
@@ -445,7 +446,7 @@ def build_demo() -> gr.Blocks:
                     interactive=False,
                     buttons=["download", "fullscreen"],
                 )
-            with gr.Tab("Area distributions"):
+            with gr.Tab("Area distributions", visible=False):
                 gr.Markdown(
                     "Histograms and exponential fits of the region areas "
                     "(IGL / PGL / combined) for this image."
@@ -459,12 +460,13 @@ def build_demo() -> gr.Blocks:
                 )
             with gr.Tab("Full summary row"):
                 summary_output = gr.Dataframe(
-                    label="Every column of granule_loss_results.csv for this image",
+                    label="granule_loss_results.csv for this image "
+                          "(percentile ratings omitted — they need multiple impacts)",
                     interactive=False,
                     wrap=True,
                     max_height=420,
                 )
-            with gr.Tab("Log"):
+            with gr.Tab("Log", visible=False):
                 log_output = gr.Textbox(
                     label="Processing log",
                     lines=22,
@@ -527,6 +529,6 @@ demo = build_demo()
 
 if __name__ == "__main__":
     demo.queue(max_size=16).launch(
-        theme=gr.themes.Soft(),
+        theme=gr.themes.Cyberpunk(),
         max_file_size=MAX_UPLOAD,
     )
