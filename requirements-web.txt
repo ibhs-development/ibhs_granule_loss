@@ -1,0 +1,16 @@
+# Dependencies for the Gradio web GUI (gradio_app.py) / Hugging Face Space.
+# On the Space this file must be named requirements.txt (see SPACE_README.md).
+#
+# Differences from the desktop requirements.txt:
+#   - adds gradio
+#   - opencv-python-headless instead of opencv-python: the headless wheel needs no
+#     libGL.so.1, which is absent from the Space container
+#   - no pyinstaller (only used to build the desktop .exe)
+gradio==6.22.0
+pandas
+numpy
+scipy
+scikit-image
+opencv-python-headless
+matplotlib
+Pillow
