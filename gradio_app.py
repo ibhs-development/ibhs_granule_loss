@@ -35,6 +35,11 @@ SCALE_AUTO = "Auto-detect"
 SCALE_CHOICES = (SCALE_AUTO, "10 mm", "20 mm")
 DEFAULT_THRESHOLD = 2.58
 
+# Shipped example so the app can be tried without an image at hand. Optional: the
+# examples block is skipped when the file is missing, so gradio_app.py + loss.py
+# still run on their own.
+SAMPLE_IMAGE = Path(__file__).resolve().parent / "Sample_image.png"
+
 # The web version processes one image per run, so nothing here should outlive a
 # request by much. Uploads bigger than this are rejected before any work starts.
 MAX_UPLOAD = "100mb"
@@ -141,7 +146,7 @@ def _headline(row: pd.Series, threshold: float) -> str:
     )
 
     return "\n\n".join([
-        f"### Results — {row.get('Impact', 'image')}",
+        f"### Results - {row.get('Impact', 'image')}",
         (
             f"**{int(row.get('Count_All', 0))}** loss regions · "
             f"total **{float(row.get('AreaSum_All_mm2', 0.0)):.3f} mm²**  \n"
@@ -356,10 +361,11 @@ def reset(previous_run_dir):
 
 INTRO = """
 # IBHS Granule Loss Analysis
+#### Developed and maintained by the IBHS AI Research Team
 
 Upload one microscope shingle image **that includes the red scale bar**. The image is
 cleaned, the scale bar is measured, granule-loss regions are segmented and every region
-is reported in mm² — the same pipeline as the IBHS desktop tool, run on a single image.
+is reported in mm² - the same pipeline as the IBHS desktop tool, run on a single image.
 
 Blue = **IGL** (area below the threshold) · Red = **PGL** (area at or above it).
 """
@@ -367,7 +373,7 @@ Blue = **IGL** (area below the threshold) · Red = **PGL** (area at or above it)
 SCALE_HELP = """
 **Auto-detect** reads the `10mm`/`20mm` label printed next to the bar; a `10mm`/`20mm` tag
 in the file name overrides it. Areas scale with the *square* of mm/px, so if the label
-cannot be read the result is flagged **unverified** — set the length here and re-run.
+cannot be read the result is flagged **unverified** - set the length here and re-run.
 """
 
 NOTES = """
@@ -380,6 +386,7 @@ NOTES = """
 * Severity ratings are not reported here: they rank an impact against the *other impacts in
   the same run*, which needs more than one image. Run the desktop app over a folder of
   impacts to get them.
+  
 """
 
 
@@ -399,21 +406,34 @@ def build_demo() -> gr.Blocks:
                     sources=["upload", "clipboard"],
                     height=420,
                 )
-                threshold_input = gr.Number(
-                    label="IGL / PGL threshold (mm²)",
-                    value=DEFAULT_THRESHOLD,
-                    minimum=0.0001,
-                    step=0.01,
-                )
-                scale_input = gr.Radio(
-                    label="Scale bar length",
-                    choices=list(SCALE_CHOICES),
-                    value=SCALE_AUTO,
-                )
-                gr.Markdown(SCALE_HELP)
+                with gr.Row():
+                    threshold_input = gr.Number(
+                        label="IGL / PGL threshold (mm²)",
+                        value=DEFAULT_THRESHOLD,
+                        minimum=0.0001,
+                        step=0.01,
+                    )
+                    scale_input = gr.Radio(
+                        label="Scale bar length",
+                        choices=list(SCALE_CHOICES),
+                        value=SCALE_AUTO,
+                    )
+                # gr.Markdown(SCALE_HELP)
                 with gr.Row():
                     run_button = gr.Button("Analyze image", variant="primary")
                     clear_button = gr.Button("Clear")
+
+                examples = None
+                if SAMPLE_IMAGE.exists():
+                    examples = gr.Examples(
+                        examples=[[str(SAMPLE_IMAGE), DEFAULT_THRESHOLD, SCALE_AUTO]],
+                        inputs=[image_input, threshold_input, scale_input],
+                        example_labels=["Sample shingle impact (10 mm scale bar)"],
+                        label="No image handy? Click the example to load and analyze it",
+                        # Caching would run the pipeline at start-up and cannot hold the
+                        # per-session temp folder that lives in gr.State.
+                        cache_examples=False,
+                    )
 
             with gr.Column(scale=1):
                 annotated_output = gr.Image(
@@ -442,7 +462,7 @@ def build_demo() -> gr.Blocks:
             with gr.Tab("Annotated image"):
                 annotated_tab_output = gr.Image(
                     label="Annotated result at full width "
-                          "(blue = IGL, red = PGL) — same image as above",
+                          "(blue = IGL, red = PGL) - same image as above",
                     type="filepath",
                     format="png",
                     interactive=False,
@@ -478,7 +498,7 @@ def build_demo() -> gr.Blocks:
             with gr.Tab("Full summary row"):
                 summary_output = gr.Dataframe(
                     label="granule_loss_results.csv for this image "
-                          "(percentile ratings omitted — they need multiple impacts)",
+                          "(percentile ratings omitted - they need multiple impacts)",
                     interactive=False,
                     wrap=True,
                     max_height=420,
@@ -509,15 +529,34 @@ def build_demo() -> gr.Blocks:
         ]
         assert len(outputs) == RESULT_COMPONENTS + 2  # log + results + state
 
+        run_inputs = [image_input, threshold_input, scale_input, run_dir_state]
+
         run_event = run_button.click(
             fn=analyze,
-            inputs=[image_input, threshold_input, scale_input, run_dir_state],
+            inputs=run_inputs,
             outputs=outputs,
             concurrency_limit=1,   # the pipeline is CPU-bound; queue instead of thrash
             show_progress="full",
             api_name="analyze",
         )
-        image_input.upload(lambda: "", outputs=headline_output)
+        # Drop a stale headline as soon as a new image arrives.
+        image_input.upload(lambda: "", outputs=headline_output, api_name=False)
+
+        # Selecting the example fills the inputs; chaining off that event runs the
+        # analysis straight away, with the session's run-folder state threaded in so
+        # the previous run's temp folder is still cleaned up.
+        cancel_targets = [run_event]
+        if examples is not None:
+            cancel_targets.append(
+                examples.load_input_event.then(
+                    fn=analyze,
+                    inputs=run_inputs,
+                    outputs=outputs,
+                    concurrency_limit=1,
+                    show_progress="full",
+                    api_name=False,
+                )
+            )
 
         clear_button.click(
             fn=reset,
@@ -538,7 +577,7 @@ def build_demo() -> gr.Blocks:
                 download_output,
                 run_dir_state,
             ],
-            cancels=[run_event],
+            cancels=cancel_targets,
         )
 
     return demo
@@ -548,6 +587,6 @@ demo = build_demo()
 
 if __name__ == "__main__":
     demo.queue(max_size=16).launch(
-        theme=gr.themes.Cyberpunk(),
+        theme=gr.themes.Neon(),
         max_file_size=MAX_UPLOAD,
     )

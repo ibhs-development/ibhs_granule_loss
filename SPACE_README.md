@@ -23,8 +23,12 @@ Opens on <http://127.0.0.1:7860>.
    cd <space-name>
    cp /path/to/ibhs_granule_loss/gradio_app.py .
    cp /path/to/ibhs_granule_loss/loss.py .
+   cp /path/to/ibhs_granule_loss/Sample_image.png .
    cp /path/to/ibhs_granule_loss/requirements-web.txt requirements.txt
    ```
+
+   `Sample_image.png` backs the click-to-run example. If it is missing the app still
+   starts and simply shows no example block.
 
    `app.py` (Tkinter) is **not** needed on the Space — it cannot run there.
    `requirements-web.txt` must be renamed to `requirements.txt`; it pins
@@ -54,7 +58,7 @@ Opens on <http://127.0.0.1:7860>.
 4. Push:
 
    ```bash
-   git add gradio_app.py loss.py requirements.txt README.md
+   git add gradio_app.py loss.py Sample_image.png requirements.txt README.md
    git commit -m "Add IBHS granule loss Gradio app"
    git push
    ```
