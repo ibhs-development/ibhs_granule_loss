@@ -42,7 +42,7 @@ LOG_FLUSH_SECONDS = 0.25
 
 # ``analyze`` yields (log, <result components>, run_dir). Intermediate yields refresh
 # only the log, so they skip this many components in between.
-RESULT_COMPONENTS = 8
+RESULT_COMPONENTS = 9
 
 # Percentile-based ratings rank an impact against the other impacts in the same
 # run. With a single image the 25/50/75th percentiles collapse onto one value, so
@@ -313,10 +313,17 @@ def analyze(image_path, threshold_value, scale_choice, previous_run_dir):
 
     lines.extend(["", "=" * 70, "Analysis completed.", "=" * 70])
 
+    # The annotated image is shown twice: next to the input, and full width in its
+    # own tab. Both components take the same file.
+    annotated_value = (
+        str(annotated_path) if annotated_path and annotated_path.exists() else None
+    )
+
     yield (
         "\n".join(lines),
         _headline(row, threshold),
-        str(annotated_path) if annotated_path and annotated_path.exists() else None,
+        annotated_value,
+        annotated_value,
         str(cropped_path) if cropped_path and cropped_path.exists() else None,
         _metrics_table(row),
         _regions_table(output_dir / "granule_loss_regions.csv"),
@@ -336,7 +343,8 @@ def reset(previous_run_dir):
         SCALE_AUTO,
         "",                                         # log
         "",                                         # headline
-        None, None,                                 # annotated / cropped
+        None, None,                                 # annotated (side by side / tab)
+        None,                                       # cropped
         pd.DataFrame(columns=["Metric", "Value"]),
         pd.DataFrame(columns=["Region_ID", "Class", "Area_px", "Area_mm2"]),
         pd.DataFrame(columns=["Field", "Value"]),
@@ -431,6 +439,15 @@ def build_demo() -> gr.Blocks:
             )
 
         with gr.Tabs():
+            with gr.Tab("Annotated image"):
+                annotated_tab_output = gr.Image(
+                    label="Annotated result at full width "
+                          "(blue = IGL, red = PGL) — same image as above",
+                    type="filepath",
+                    format="png",
+                    interactive=False,
+                    buttons=["download", "fullscreen"],
+                )
             with gr.Tab("Per-region areas"):
                 regions_output = gr.Dataframe(
                     label="Every detected loss region, largest first",
@@ -481,6 +498,7 @@ def build_demo() -> gr.Blocks:
             log_output,
             headline_output,
             annotated_output,
+            annotated_tab_output,
             cropped_output,
             metrics_output,
             regions_output,
@@ -511,6 +529,7 @@ def build_demo() -> gr.Blocks:
                 log_output,
                 headline_output,
                 annotated_output,
+                annotated_tab_output,
                 cropped_output,
                 metrics_output,
                 regions_output,
