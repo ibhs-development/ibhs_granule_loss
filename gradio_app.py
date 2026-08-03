@@ -9,8 +9,6 @@ renders the input, the annotated output and the reported metrics side by side.
 Run locally:
 
     python gradio_app.py
-
-Deploy: see SPACE_README.md (Hugging Face Space entry point / requirements).
 """
 
 from __future__ import annotations
