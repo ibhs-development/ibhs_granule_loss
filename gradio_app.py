@@ -27,10 +27,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gradio as gr
 
-from loss import IMAGE_EXTENSIONS, process_granule_loss
+from loss import IMAGE_EXTENSIONS, SCALE_BAR_CANDIDATES_MM, process_granule_loss
 
 SCALE_AUTO = "Auto-detect"
-SCALE_CHOICES = (SCALE_AUTO, "10 mm", "20 mm")
+# Derived from the pipeline's own candidate list so the GUI cannot offer a length
+# the reader does not know about, or miss one it does.
+SCALE_CHOICES = (SCALE_AUTO, *(f"{mm} mm" for mm in SCALE_BAR_CANDIDATES_MM))
+SCALE_TAGS = " / ".join(f"`{mm}mm`" for mm in SCALE_BAR_CANDIDATES_MM)
 DEFAULT_THRESHOLD = 2.58
 
 # Shipped example so the app can be tried without an image at hand. Optional: the
@@ -80,7 +83,7 @@ def _safe_stem(name: str) -> str:
     """
     Keep the parts of an uploaded file name the pipeline actually reads.
 
-    ``loss.scale_mm_from_filename`` looks for a ``10mm``/``20mm`` tag in the stem,
+    ``loss.scale_mm_from_filename`` looks for a ``5mm`` ... ``30mm`` tag in the stem,
     so the stem is preserved rather than replaced by a random name; everything that
     is not a plain name character is dropped so the staged path stays predictable.
     """
@@ -138,7 +141,7 @@ def _headline(row: pd.Series, threshold: float) -> str:
             f"The bar length could not be read from the image; **{bar_mm:g} mm** was assumed "
             f"(from {source}). Areas scale with the *square* of mm/px, so a 10 mm bar read as "
             f"20 mm makes every area 4x too large. Set **Scale bar length** explicitly and "
-            f"re-run, or name the file with a `10mm` / `20mm` tag.\n\n"
+            f"re-run, or name the file with a {SCALE_TAGS} tag.\n\n"
             f"Scale used: **{bar_mm:g} mm = {bar_px:.0f} px**"
         )
     )
@@ -368,10 +371,10 @@ is reported in mm² - the same pipeline as the IBHS desktop tool, run on a singl
 Blue = **IGL** (area below the threshold) · Red = **PGL** (area at or above it).
 """
 
-SCALE_HELP = """
-**Auto-detect** reads the `10mm`/`20mm` label printed next to the bar; a `10mm`/`20mm` tag
-in the file name overrides it. Areas scale with the *square* of mm/px, so if the label
-cannot be read the result is flagged **unverified** - set the length here and re-run.
+SCALE_HELP = f"""
+**Auto-detect** reads the printed label next to the bar ({SCALE_TAGS}); a matching tag in
+the file name overrides it. Areas scale with the *square* of mm/px, so if the label cannot
+be read the result is flagged **unverified** - set the length here and re-run.
 """
 
 NOTES = """

@@ -1,3 +1,6 @@
+import base64
+import functools
+import re
 from collections import deque
 from pathlib import Path
 
@@ -32,16 +35,49 @@ GENERATED_IMAGE_SUFFIXES = (CROPPED_SUFFIX, ANNOTATED_SUFFIX, "_cleaned")
 IGNORED_OUTPUT_FILENAMES = {"granule_loss_plot.png"}
 
 # Scale-bar length detection
-SCALE_BAR_CANDIDATES_MM = (10, 20)  # bar lengths the label reader resolves
+SCALE_BAR_CANDIDATES_MM = (5, 10, 15, 20, 25, 30)  # bar lengths the label reader resolves
 DEFAULT_SCALE_BAR_MM = 20           # last-resort assumption; always logged as unverified
-# w(first digit) / w("0"), measured on the label's own glyphs so the comparison is
-# font-normalised. Measured over 33 system fonts: a "1" never exceeds 0.944 (fonts
-# whose "1" carries a foot serif -- Times, Courier, Tahoma, DejaVu -- sit high), and
-# a "2" never drops below 0.883. The band between the constants below therefore
-# covers the whole overlap, and ratios landing in it are reported as unresolved
-# rather than guessed: a silently wrong bar length would scale every area by 4x.
-DIGIT_RATIO_ONE_MAX = 0.82
-DIGIT_RATIO_TWO_MIN = 0.95
+
+# Reading the printed label
+#
+# The candidates share a rigid structure that does most of the work: a label is
+# either one digit ("5mm") or two ("10mm" ... "30mm"), so the glyph count alone
+# decides between "5" and the rest, and the only two-digit strings that exist are
+# 10/15/20/25/30. The reader therefore never identifies a free-form number - it
+# scores the six candidate strings and picks one.
+#
+# Each digit glyph is height-normalised onto LABEL_GLYPH_CANVAS (aspect ratio
+# preserved, so "1" stays narrow), averaged down to LABEL_GLYPH_GRID and compared
+# against the mean templates below by Euclidean distance. A candidate is only
+# accepted when it beats the runner-up by LABEL_MATCH_MIN_MARGIN (relative to the
+# winner's own distance); anything closer is reported as unresolved rather than
+# guessed, because a silently wrong bar length scales every area by the square of
+# the error - reading a 10 mm bar as 20 mm makes every area 4x too large.
+LABEL_GLYPH_CANVAS = (32, 40)       # (height, width) in px
+LABEL_GLYPH_GRID = (12, 10)         # (rows, cols) the canvas is averaged down to
+LABEL_MATCH_MIN_MARGIN = 0.12
+
+# Mean glyph templates for the only digits the candidates use, as uint8 (0-255)
+# LABEL_GLYPH_GRID cells in row-major order, base64-encoded.
+#
+# Provenance: averaged over the glyph bodies the reader itself extracts from
+# synthetic labels rendered in 43 macOS text fonts (sans, serif and mono; no script
+# or decorative faces) x 3 cap heights x both annotation styles - 1214 labels. Taking
+# the templates from segmented output rather than from raw font outlines matters,
+# because an outlined glyph's body is eroded by its own inner stroke.
+#
+# Measured with leave-one-font-out validation at the margin above: 100% precision
+# (0 errors) and 89% coverage on text fonts, 99.8% precision on 158 held-out
+# decorative and non-Latin faces. Labels set in old-style figures (Georgia, Iowan)
+# are not read at all - their digits have mixed heights, which the glyph-run check
+# rejects before classification.
+_DIGIT_TEMPLATES_B64 = {
+    "0": "AAABTNvfSwEAAAAAGtCBhtAXAAAAA1TDHyDNSwIAAAaCmgoSq3gEAAEIn38JFpOLBgABCKh2DBaJlQYAAQirdBMOi5EGAAEIpH4SCpaDBgAABoqXDQ2vbAQAAANfvhomzz8CAAAAI9d8jMQRAAAAAANa4dU+AQAA",
+    "1": "AAAAEFuWPwMAAAAADEmhwEIDAAAAABRUpr9BAwAAAAAJOXquPgMAAAAAAxhQqDwDAAAAAAMGSKk7AwAAAAEBBEqoOQIAAAAAAQNLpzcCAAAAAAEDTaY3AgAAAAABBU+lOQIAAAAACSRfsFgJAAAAABdkh9GWEgAA",
+    "2": "AAENcuXiUwMAAAACNcmHoNUgAAAAAkqEHDnSSgEAAAIsQgchx1EDAAABBwwENdE5AQAAAAECCnfAFgAAAAABBjnOWQMAAAAAAh2ToA8BAAAAAAlcujAFBQAAAAEnrXAWGRkDAAAEYNaRholBBAAABYn49vX2YwUA",
+    "3": "AAAOg+beUQQAAAAAK7Nxn8IXAAAAATJlEz3HLgAAAAASIggvuysAAAAAAgYqfqUQAAAAAAEbs+VjBAAAAAACC0KYzR4BAAABBwoHIM9NAQAAASUjBw++XgIAAAJNXBIqzUQBAAABUrlslsQWAAAAAB2i5ck8AQAA",
+    "5": "AAAmy/L16TgCAAAAKb6MgX4iAQAAAC21KBEVCAAAAAA0ujYoDgEAAAAAPtG0q1IFAAAAAEbIka+7IAAAAAEkNhM+0ksCAAABBQgFE79iAwAAAiMeBxC8XgMAAAJWWxMy0j0BAAACWr10orsSAAAAASCr6sQzAgAA",
+}
 
 # Annotated (analysed) image rendering
 IGL_COLOR = (0, 110, 230)          # RGB, blue: individual granule loss (< cutoff)
@@ -61,6 +97,17 @@ def _read_rgb(path: Path) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 def detect_scale_mm(image_path, target_max_dim=1200, bottom_frac=0.4, px_threshold=None):
+    """
+    Legacy 10-vs-20 guess from the bar's width as a fraction of the image width.
+
+    No longer part of the resolution chain in :func:`measure_scale`, and kept only
+    so existing scripts that import it still work. It cannot express the six bar
+    lengths in SCALE_BAR_CANDIDATES_MM, and its fixed-framing assumption does not
+    hold: on both reference images in this repository it is wrong by exactly 2x
+    (Sample_image is 10 mm and reads as 20, example_5mm is 5 mm and reads as 10),
+    which would make every reported area 4x too large. An unreadable label is now
+    reported as unverified instead.
+    """
     img = cv2.imread(image_path)
     if img is None:
         raise FileNotFoundError(image_path)
@@ -411,72 +458,37 @@ def find_scale_bar(rgb: np.ndarray) -> dict | None:
     }
 
 
-def _label_line_bbox(ink: np.ndarray, bar_len: float) -> tuple[int, int, int, int] | None:
+def _glyph_boxes(ink: np.ndarray, bar_len: float) -> list[list[tuple]]:
     """
-    Group ink components into text lines and return the line that most likely
-    holds the scale label (text-shaped, close to the bar).
-    """
-    n, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
-    comps = []
-    for i in range(1, n):
-        x, y, w, h, area = (int(v) for v in stats[i][:5])
-        if area < 12 or h < 0.04 * bar_len or h > 0.35 * bar_len or w > 1.6 * bar_len:
-            continue  # noise, loss blobs, image borders
-        comps.append((x, y, w, h))
-    if not comps:
-        return None
+    Decompose the search box into per-glyph candidates, two ways.
 
-    # Greedily group components that share a horizontal band -> one text line.
-    comps.sort(key=lambda c: c[1] + c[3] / 2.0)
-    median_h = float(np.median([c[3] for c in comps]))
-    lines: list[list[tuple[int, int, int, int]]] = []
-    for comp in comps:
-        center = comp[1] + comp[3] / 2.0
-        for line in lines:
-            line_center = float(np.mean([c[1] + c[3] / 2.0 for c in line]))
-            if abs(center - line_center) <= max(4.0, 0.6 * median_h):
-                line.append(comp)
-                break
-        else:
-            lines.append([comp])
+    Two annotation styles occur in practice. Plain dark text gives one ink
+    component per glyph. Outlined text - white glyphs with a dark stroke, which is
+    what the IBHS annotator produces - merges the strokes of neighbouring glyphs
+    into one component, and merges that component with any loss blob it touches;
+    there each glyph survives instead as an enclosed white *pocket* inside the ink.
+    Both decompositions are returned and the caller keeps whichever one validates.
 
-    best = None
-    for line in lines:
-        x1 = min(c[0] for c in line)
-        y1 = min(c[1] for c in line)
-        x2 = max(c[0] + c[2] for c in line)
-        y2 = max(c[1] + c[3] for c in line)
-        width, height = x2 - x1, y2 - y1
-        if height <= 0 or not (1.2 <= width / height <= 8.0):
-            continue  # a scale label is a short wide string
-        # Prefer the text line closest to the bottom of the search box (the bar).
-        score = y2
-        if best is None or score > best[0]:
-            best = (score, (x1, y1, x2, y2))
-    return best[1] if best else None
+    The pocket route is what makes the reader robust to blobs touching the label:
+    a blob merging into the outline does not change the pockets it encloses.
 
-
-def _glyph_box_candidates(ink: np.ndarray) -> list[list[tuple[int, int, int, int]]]:
-    """
-    Decompose a cropped label into per-glyph boxes, left to right.
-
-    Two annotation styles occur in practice: plain dark text, where each glyph is
-    its own ink component, and outlined/stroked text, where the glyph bodies touch
-    and merge into one component but each body survives as an enclosed hole. Both
-    decompositions are returned; the caller keeps whichever one validates.
+    Each entry is ``(x, y, w, h, component_label, label_image)`` so the caller can
+    recover the glyph's own mask, not just its box.
     """
     height, width = ink.shape
-    min_area = max(8, 0.004 * height * width)
 
-    def _clean(boxes):
-        if not boxes:
-            return []
-        tallest = max(b[3] for b in boxes)
-        boxes = [b for b in boxes if b[3] >= 0.45 * tallest and b[2] >= 2]
+    def plausible(row) -> bool:
+        _, _, row_w, row_h, area = (int(v) for v in row[:5])
+        # Label text is small relative to the bar it annotates; anything outside
+        # this band is a loss blob, an image border or noise.
+        return (area >= 10
+                and 0.03 * bar_len <= row_h <= 0.45 * bar_len
+                and row_w <= 0.6 * bar_len)
 
+    def drop_nested(boxes):
+        # The middle of an outlined "0" is itself an enclosed region inside the
+        # glyph body it belongs to; it is a counter, not a glyph of its own.
         def nested(box):
-            # A glyph counter (the hole in "0") shows up as its own component
-            # inside the glyph it belongs to; it is not a glyph of its own.
             return any(
                 other is not box
                 and other[0] <= box[0] and other[1] <= box[1]
@@ -485,70 +497,233 @@ def _glyph_box_candidates(ink: np.ndarray) -> list[list[tuple[int, int, int, int
                 for other in boxes
             )
 
-        return sorted((b for b in boxes if not nested(b)), key=lambda b: b[0])
+        return [box for box in boxes if not nested(box)]
 
-    # Strategy A: ink components (plain text)
-    n, _, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
-    direct = _clean([
-        tuple(int(v) for v in stats[i][:4])
-        for i in range(1, n) if stats[i][4] >= min_area
+    # Strategy A: ink components (plain dark text)
+    n, labels, comp_stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), 8)
+    direct = drop_nested([
+        (*(int(v) for v in comp_stats[i][:4]), i, labels)
+        for i in range(1, n) if plausible(comp_stats[i])
     ])
 
-    # Strategy B: enclosed holes (outlined text) -> the glyph bodies
-    n, _, stats, _ = cv2.connectedComponentsWithStats((~ink).astype(np.uint8), 4)
-    pockets = _clean([
-        tuple(int(v) for v in stats[i][:4])
-        for i in range(1, n)
-        if stats[i][4] >= min_area
-        and stats[i][0] > 0 and stats[i][1] > 0
-        and stats[i][0] + stats[i][2] < width      # touching the crop border means
-        and stats[i][1] + stats[i][3] < height     # background, not a glyph body
-    ])
+    # Strategy B: enclosed pockets of ink (outlined text) -> the glyph bodies
+    n, labels, comp_stats, _ = cv2.connectedComponentsWithStats((~ink).astype(np.uint8), 4)
+    pockets = []
+    for i in range(1, n):
+        x, y, box_w, box_h = (int(v) for v in comp_stats[i][:4])
+        if x == 0 or y == 0 or x + box_w >= width or y + box_h >= height:
+            continue  # touches the crop border, so it is background, not a body
+        if plausible(comp_stats[i]):
+            pockets.append((x, y, box_w, box_h, i, labels))
+    pockets = drop_nested(pockets)
 
-    return [boxes for boxes in (direct, pockets) if len(boxes) >= 4]
+    return [boxes for boxes in (direct, pockets) if len(boxes) >= 3]
 
 
-def _match_digit_mm_glyphs(glyphs: list[tuple[int, int, int, int]]):
+def _glyph_lines(boxes: list[tuple]) -> list[list[tuple]]:
+    """Group glyph boxes that share a horizontal band into text lines, left to right."""
+    boxes = sorted(boxes, key=lambda b: b[1] + b[3] / 2.0)
+    median_h = float(np.median([b[3] for b in boxes]))
+    lines: list[list[tuple]] = []
+    for box in boxes:
+        center = box[1] + box[3] / 2.0
+        for line in lines:
+            line_center = float(np.mean([b[1] + b[3] / 2.0 for b in line]))
+            if abs(center - line_center) <= max(3.0, 0.5 * median_h):
+                line.append(box)
+                break
+        else:
+            lines.append([box])
+    for line in lines:
+        line.sort(key=lambda b: b[0])
+    return lines
+
+
+def _mm_glyph_run(line: list[tuple]):
     """
-    Find a ``<digit><digit>mm`` run inside a list of glyph boxes.
+    Find a ``<digit>mm`` or ``<digit><digit>mm`` run inside one text line.
 
-    Validating the whole four-glyph signature — two cap-height digits followed by
-    two matching, wider, x-height ``m`` glyphs — is what keeps the reader from
-    accidentally measuring the two ``m`` glyphs against each other (they have equal
-    widths, which would always look like a "2").
+    Validating the whole signature - one or two cap-height digits followed by two
+    matching, wider, x-height ``m`` glyphs - is what keeps stray blobs from being
+    counted as digits, and is also how the digit *count* is established: that count
+    alone separates "5mm" from the two-digit candidates before any shape matching
+    happens.
 
-    Returns (first_digit_width, zero_width, cap_height) or None.
+    Because of that, a dropped leading digit is the one error the classifier cannot
+    catch: the "5" of a "25mm" label is a perfectly good 5, so reading it as "5mm"
+    looks confident while making every area 25x too small. A run is therefore
+    rejected outright if any glyph abuts its first digit - whatever that glyph is,
+    this run is not the whole label.
+
+    Returns ``(digit_boxes, m_boxes, cap_height)`` or None.
     """
-    for i in range(len(glyphs) - 3):
-        d1, d2, m1, m2 = glyphs[i:i + 4]
-        cap = max(d1[3], d2[3])
-        if cap <= 0 or min(d1[3], d2[3]) < 0.88 * cap:
-            continue                                        # digits share cap height
-        if not all(0.5 * cap <= m[3] <= 0.92 * cap for m in (m1, m2)):
-            continue                                        # m sits at x-height
-        if abs(m1[3] - m2[3]) > 0.18 * cap:
-            continue                                        # the two m's match...
-        if abs(m1[2] - m2[2]) > 0.22 * max(m1[2], m2[2]):
-            continue
-        if min(m1[2], m2[2]) <= 0.9 * d2[2]:
-            continue                                        # ...and m is wider than a digit
-        gaps = [b[0] - (a[0] + a[2]) for a, b in zip((d1, d2, m1), (d2, m1, m2))]
-        if any(gap > 0.9 * cap or gap < -0.25 * cap for gap in gaps):
-            continue                                        # one tight run, not stray blobs
-        if d2[2] <= 0:
-            continue
-        return d1[2], d2[2], cap
+    # Where two outlined glyphs touch, the white gap between them is enclosed too
+    # and shows up as its own short pocket. Left in, it splits the run so that the
+    # leading digit falls outside it - which is how "25mm" turns into "5mm". Nothing
+    # in a "<digits>mm" label is much shorter than the tallest glyph, so drop them.
+    tallest = max(b[3] for b in line)
+    glyphs = [b for b in line if b[3] >= 0.4 * tallest]
+
+    for n_digits in (2, 1):
+        need = n_digits + 2
+        for i in range(len(glyphs) - need + 1):
+            run = glyphs[i:i + need]
+            digits, ms = run[:n_digits], run[n_digits:]
+            digit_heights = [int(d[3]) for d in digits]
+            m_widths = [int(m[2]) for m in ms]
+            m_heights = [int(m[3]) for m in ms]
+            cap = max(digit_heights)
+            if cap <= 0 or min(digit_heights) < 0.85 * cap:
+                continue                                    # digits share cap height
+            if not all(0.45 * cap <= mh <= 0.95 * cap for mh in m_heights):
+                continue                                    # m sits at x-height
+            if abs(m_heights[0] - m_heights[1]) > 0.2 * cap:
+                continue                                    # the two m's match...
+            if abs(m_widths[0] - m_widths[1]) > 0.25 * max(m_widths):
+                continue
+            if min(m_widths) <= 0.9 * int(digits[-1][2]):
+                continue                                    # ...and m is wider than the digit it follows
+            gaps = [b[0] - (a[0] + a[2]) for a, b in zip(run, run[1:])]
+            if any(gap > 0.9 * cap or gap < -0.3 * cap for gap in gaps):
+                continue                                    # one tight run, not stray blobs
+            if i > 0:
+                # Nothing legitimately sits just left of a label's first digit, so
+                # whatever this is - a dropped digit (an old-style "2" is shorter
+                # than the "5" beside it, so its height proves nothing) or a blob
+                # overlapping the text - the reading cannot be trusted. Bailing out
+                # here costs coverage and buys correctness, which is the right way
+                # round when the error would be a 5x scale.
+                previous = glyphs[i - 1]
+                if digits[0][0] - (previous[0] + previous[2]) <= 0.9 * cap:
+                    continue
+            return digits, ms, cap
     return None
+
+
+def _glyph_mask(box: tuple) -> np.ndarray:
+    """Recover a glyph's own pixels from its connected-component box."""
+    x, y, w, h, index, labels = box
+    return labels[y:y + h, x:x + w] == index
+
+
+def _glyph_signature(mask: np.ndarray) -> np.ndarray | None:
+    """
+    Height-normalise a glyph body and average it down to LABEL_GLYPH_GRID.
+
+    The aspect ratio is preserved and the glyph is centred on a fixed canvas, so
+    width survives as a feature - it is the strongest single cue that separates a
+    "1" from the other leading digits.
+    """
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return None
+    tight = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.float32)
+    height, width = LABEL_GLYPH_CANVAS
+    h, w = tight.shape
+    scaled_w = min(width, max(1, int(round(w * height / h))))
+    tight = cv2.resize(tight, (scaled_w, height), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((height, width), np.float32)
+    x0 = (width - scaled_w) // 2
+    canvas[:, x0:x0 + scaled_w] = tight
+    rows, cols = LABEL_GLYPH_GRID
+    return cv2.resize(canvas, (cols, rows), interpolation=cv2.INTER_AREA).ravel()
+
+
+@functools.lru_cache(maxsize=1)
+def _digit_templates() -> dict[str, np.ndarray]:
+    """Decode the embedded mean glyph templates (see _DIGIT_TEMPLATES_B64)."""
+    rows, cols = LABEL_GLYPH_GRID
+    templates = {}
+    for digit, encoded in _DIGIT_TEMPLATES_B64.items():
+        flat = np.frombuffer(base64.b64decode(encoded), dtype=np.uint8)
+        if flat.size != rows * cols:
+            raise ValueError(f"digit template '{digit}' has {flat.size} cells, expected {rows*cols}")
+        templates[digit] = flat.astype(np.float32) / 255.0
+    return templates
+
+
+def _classify_label(digit_masks: list[np.ndarray]) -> tuple[int | None, dict]:
+    """
+    Decide which of SCALE_BAR_CANDIDATES_MM a label's digit glyphs spell.
+
+    Only the candidates that exist are scored, so an impossible reading such as
+    "35mm" can never come out, and a one-glyph label is only ever accepted as
+    "5mm". The winner must beat the runner-up by LABEL_MATCH_MIN_MARGIN or the
+    label is reported as unresolved.
+    """
+    templates = _digit_templates()
+    info: dict[str, object]
+    observed = [_glyph_signature(mask) for mask in digit_masks]
+    if any(sig is None for sig in observed):
+        return None, {"reason": "a label glyph was empty"}
+
+    candidates = [
+        (mm, str(mm)) for mm in SCALE_BAR_CANDIDATES_MM
+        if len(str(mm)) == len(observed) and all(d in templates for d in str(mm))
+    ]
+    if not candidates:
+        return None, {"reason": f"no candidate bar length has {len(observed)} digit(s)"}
+
+    scored = sorted(
+        (
+            (mm, sum(float(np.linalg.norm(sig - templates[d])) for sig, d in zip(observed, text)))
+            for mm, text in candidates
+        ),
+        key=lambda item: item[1],
+    )
+    best_mm, best_distance = scored[0]
+
+    if len(scored) == 1:
+        # A single-glyph label can only be "5mm", so there is no rival candidate to
+        # measure a margin against. Score it against the individual digits instead,
+        # which is what catches a mis-segmented label (a lone "0", say) rather than
+        # waving it through as a 5.
+        per_digit = sorted(
+            ((d, float(np.linalg.norm(observed[0] - t))) for d, t in templates.items()),
+            key=lambda item: item[1],
+        )
+        margin = (per_digit[1][1] - per_digit[0][1]) / max(1e-9, per_digit[0][1])
+        info = {
+            "match_margin": round(margin, 3),
+            "glyph_scores": {d: round(v, 3) for d, v in per_digit},
+        }
+        if per_digit[0][0] != str(best_mm):
+            info["reason"] = (
+                f"the single label glyph matches '{per_digit[0][0]}', not the '5' that "
+                f"a one-digit bar label must be"
+            )
+            return None, info
+        if margin < LABEL_MATCH_MIN_MARGIN:
+            info["reason"] = (
+                f"'{per_digit[0][0]}' beats '{per_digit[1][0]}' by only {margin:.0%} "
+                f"(need {LABEL_MATCH_MIN_MARGIN:.0%})"
+            )
+            return None, info
+        info["reason"] = f"one glyph, matched '5' by {margin:.0%}"
+        return best_mm, info
+
+    margin = (scored[1][1] - best_distance) / max(1e-9, best_distance)
+    info = {
+        "match_margin": round(margin, 3),
+        "candidate_scores": {str(mm): round(v, 3) for mm, v in scored},
+    }
+    if margin < LABEL_MATCH_MIN_MARGIN:
+        info["reason"] = (
+            f"{best_mm} mm beats {scored[1][0]} mm by only {margin:.0%} "
+            f"(need {LABEL_MATCH_MIN_MARGIN:.0%})"
+        )
+        return None, info
+    info["reason"] = f"matched '{best_mm}mm', {margin:.0%} clear of '{scored[1][0]}mm'"
+    return best_mm, info
 
 
 def read_scale_label_mm(rgb: np.ndarray, bar: dict) -> tuple[int | None, dict]:
     """
-    Read the "10mm"/"20mm" label printed next to the scale bar.
+    Read the "5mm" ... "30mm" label printed next to the scale bar.
 
-    The two candidates differ only in their first digit, so the first digit's ink
-    width is compared against the "0" next to it. Using the label's own glyphs
-    keeps the test independent of the font, size and stroke style. Returns
-    (mm or None, info) where info explains the decision.
+    Returns (mm or None, info) where info explains the decision. None means the
+    label could not be resolved confidently - callers must treat the scale as
+    unverified rather than substituting a guess.
     """
     height, width = rgb.shape[:2]
     bar_len = bar["length_px"]
@@ -563,59 +738,63 @@ def read_scale_label_mm(rgb: np.ndarray, bar: dict) -> tuple[int | None, dict]:
 
     box = rgb[y1:y2, x1:x2]
     gray = luminance(box)
-    # Blank the bar rows so the red bar itself is never mistaken for text.
-    bar_rows = slice(max(0, bar["y1"] - y1 - 2), max(0, bar["y2"] - y1 + 3))
+    # Pure red has a luminance of only 76, so the bar itself reads as ink and its
+    # anti-aliased edge would otherwise be picked up as a text line just below the
+    # label. Mask the red out instead of blanking fixed rows.
+    hsv = cv2.cvtColor(box, cv2.COLOR_RGB2HSV)
+    red = cv2.inRange(hsv, np.array((0, 70, 70)), np.array((12, 255, 255))) | \
+          cv2.inRange(hsv, np.array((168, 70, 70)), np.array((180, 255, 255)))
+    red = cv2.dilate(red, np.ones((3, 3), np.uint8), iterations=2) > 0
+    bar_top = bar["y1"] - y1
 
-    for ink_threshold in (120, 160, 90):
-        ink = gray <= ink_threshold
-        ink[bar_rows, :] = False
-        line = _label_line_bbox(ink, bar_len)
-        if line is None:
-            continue
-
-        lx1, ly1, lx2, ly2 = line
-        matched = None
-        for glyphs in _glyph_box_candidates(ink[ly1:ly2, lx1:lx2]):
-            matched = _match_digit_mm_glyphs(glyphs)
-            if matched is not None:
-                break
-        if matched is None:
-            info = {
-                "reason": "could not resolve a '<digit><digit>mm' label next to the bar",
-                "ink_threshold": ink_threshold,
-            }
-            continue
-
-        first_w, zero_w, cap = matched
-        ratio = first_w / zero_w
-        info = {
-            "ink_threshold": ink_threshold,
-            "digit_width_ratio": round(float(ratio), 3),
-            "label_box": (x1 + lx1, y1 + ly1, x1 + lx2, y1 + ly2),
-            "text_height_px": int(cap),
-        }
-        if ratio <= DIGIT_RATIO_ONE_MAX:
-            info["reason"] = f"first digit is narrow (w/w0={ratio:.2f}) -> '1'"
-            return 10, info
-        if ratio >= DIGIT_RATIO_TWO_MIN:
-            info["reason"] = f"first digit is wide (w/w0={ratio:.2f}) -> '2'"
-            return 20, info
-        info["reason"] = (
-            f"first-digit width ratio {ratio:.2f} falls in the ambiguous band "
-            f"({DIGIT_RATIO_ONE_MAX}-{DIGIT_RATIO_TWO_MIN})"
-        )
-        return None, info
+    for ink_threshold in (120, 160, 90, 190):
+        ink = (gray <= ink_threshold) & (~red)
+        for boxes in _glyph_boxes(ink, bar_len):
+            lines = _glyph_lines(boxes)
+            # The label is the text line sitting closest to the bar it annotates.
+            lines.sort(key=lambda group: abs(np.mean([b[1] + b[3] for b in group]) - bar_top))
+            for line in lines:
+                run = _mm_glyph_run(line)
+                if run is None:
+                    continue
+                digits, ms, cap = run
+                mm, detail = _classify_label([_glyph_mask(b) for b in digits])
+                detail = {
+                    **detail,
+                    "ink_threshold": ink_threshold,
+                    "n_digits": len(digits),
+                    "text_height_px": int(cap),
+                    "label_box": (x1 + line[0][0], y1 + min(b[1] for b in line),
+                                  x1 + max(b[0] + b[2] for b in line),
+                                  y1 + max(b[1] + b[3] for b in line)),
+                }
+                if mm is not None:
+                    return mm, detail
+                info = detail  # keep the most informative failure to report
 
     return None, info
 
 
+_FILENAME_TAG_RE = re.compile(
+    r"(?<!\d)("
+    + "|".join(str(mm) for mm in sorted(SCALE_BAR_CANDIDATES_MM, reverse=True))
+    + r")mm(?![A-Za-z0-9])"
+)
+
+
 def scale_mm_from_filename(image_path: Path) -> int | None:
-    """Read an explicit ``10mm`` / ``20mm`` tag out of the file name, if present."""
+    """
+    Read an explicit ``5mm`` ... ``30mm`` tag out of the file name, if present.
+
+    The tag has to stand on its own: the digits must not be preceded by another
+    digit, so ``impact_15mm`` reads as 15 mm rather than matching the ``5mm``
+    inside it and ``impact_105mm`` matches nothing rather than silently becoming
+    5 mm, and ``mm`` must not run into another word character, so ``20mmol``
+    matches nothing. Separators around the tag are fine (``impact_15mm_v2``).
+    """
     stem = image_path.stem.lower().replace(" ", "")
-    for candidate in SCALE_BAR_CANDIDATES_MM:
-        if f"{candidate}mm" in stem:
-            return int(candidate)
-    return None
+    match = _FILENAME_TAG_RE.search(stem)
+    return int(match.group(1)) if match else None
 
 
 def measure_scale(
@@ -627,10 +806,10 @@ def measure_scale(
     """
     Work out mm/px for an ORIGINAL image and report how the bar length was decided.
 
-    Resolution order: explicit override -> ``10mm``/``20mm`` file-name tag ->
-    the printed label next to the bar -> the legacy width-fraction guess ->
-    ``DEFAULT_SCALE_BAR_MM``. Only the first three are treated as trustworthy;
-    the rest are flagged so a wrong scale cannot pass unnoticed.
+    Resolution order: explicit override -> ``5mm`` ... ``30mm`` file-name tag ->
+    the printed label next to the bar -> ``DEFAULT_SCALE_BAR_MM``. Only the first
+    three are treated as trustworthy; the default is flagged so a wrong scale
+    cannot pass unnoticed.
     """
     def emit(message):
         if log:
@@ -657,21 +836,14 @@ def measure_scale(
             bar_mm, source, confident = float(read_mm), "label", True
             emit(f"      scale read from label: {read_mm} mm ({label_info.get('reason')})")
         else:
-            guess = detect_scale_mm(str(img_path))
-            if guess is not None:
-                bar_mm, source, confident = float(guess), "width-heuristic", False
-                emit(
-                    f"      WARNING: could not read the scale label "
-                    f"({label_info.get('reason')}); fell back to the bar-width guess "
-                    f"-> {guess:g} mm. Verify this image, use the scale-bar override, "
-                    f"or add a '10mm'/'20mm' tag to the file name."
-                )
-            else:
-                bar_mm, source, confident = float(DEFAULT_SCALE_BAR_MM), "default", False
-                emit(
-                    f"      WARNING: no scale label and no bar-width guess; assuming "
-                    f"{DEFAULT_SCALE_BAR_MM} mm. Areas for this image may be wrong."
-                )
+            bar_mm, source, confident = float(DEFAULT_SCALE_BAR_MM), "default", False
+            tags = " / ".join(f"'{mm}mm'" for mm in SCALE_BAR_CANDIDATES_MM)
+            emit(
+                f"      WARNING: could not read the scale label "
+                f"({label_info.get('reason')}); assuming {DEFAULT_SCALE_BAR_MM} mm. "
+                f"Areas for this image are probably wrong - set the scale-bar "
+                f"override, or add a {tags} tag to the file name."
+            )
 
     return {
         "mm_per_px": bar_mm / bar_px,
@@ -1092,8 +1264,8 @@ def process_granule_loss(
         igl_cutoff_mm2 (float): Threshold for IGL vs PGL classification (default: 2.58)
         log_callback (callable): Optional callback function for logging messages
         forced_scale_mm (float): Scale-bar length in mm to use for every image.
-            None (default) auto-detects per image: a ``10mm``/``20mm`` file-name tag
-            wins, otherwise the label printed next to the bar is read.
+            None (default) auto-detects per image: a ``5mm`` ... ``30mm`` file-name
+            tag wins, otherwise the label printed next to the bar is read.
 
     Returns:
         tuple: (summary_df, fig) - DataFrame with results and matplotlib figure
@@ -1324,10 +1496,11 @@ def process_granule_loss(
             f"{', '.join(unverified_scales[:12])}"
             f"{' ...' if len(unverified_scales) > 12 else ''}"
         )
+        tags = " / ".join(f"'{mm}mm'" for mm in SCALE_BAR_CANDIDATES_MM)
         log(
             "  Areas scale with the square of mm/px, so a 10 mm bar read as 20 mm "
             "makes every area 4x too large. Fix these by setting the scale-bar length "
-            "explicitly, or by adding a '10mm'/'20mm' tag to the file name. "
+            f"explicitly, or by adding a {tags} tag to the file name. "
             "Check the 'Scale_Verified' column and the header of each annotated image."
         )
 

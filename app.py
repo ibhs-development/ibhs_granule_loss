@@ -6,10 +6,13 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for thread safety
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from loss import process_granule_loss
+from loss import SCALE_BAR_CANDIDATES_MM, process_granule_loss
 
 SCALE_AUTO = "Auto-detect"
-SCALE_CHOICES = (SCALE_AUTO, "10 mm", "20 mm")
+# Derived from the pipeline's own candidate list so the GUI cannot offer a length
+# the reader does not know about, or miss one it does.
+SCALE_CHOICES = (SCALE_AUTO, *(f"{mm} mm" for mm in SCALE_BAR_CANDIDATES_MM))
+SCALE_TAGS = "/".join(f"'{mm}mm'" for mm in SCALE_BAR_CANDIDATES_MM)
 
 
 class GranuleLossApp:
@@ -106,8 +109,8 @@ class GranuleLossApp:
         ttk.Label(
             settings_frame,
             text=(
-                "Auto reads the mm label printed next to each bar; a '10mm'/'20mm' file-name "
-                "tag overrides it. Set a value here to force it for every image."
+                f"Auto reads the mm label printed next to each bar; a {SCALE_TAGS} "
+                f"file-name tag overrides it. Set a value here to force it for every image."
             ),
         ).grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=(8, 0), pady=(8, 0))
 
@@ -301,7 +304,7 @@ class GranuleLossApp:
                         f"{', '.join(map(str, unverified[:8]))}"
                         f"{' ...' if len(unverified) > 8 else ''}\n\n"
                         "Their areas may be wrong by 4x. Set 'Scale bar length' explicitly "
-                        "and re-run, or tag those file names with '10mm'/'20mm'."
+                        f"and re-run, or tag those file names with {SCALE_TAGS}."
                     )
             self.root.after(0, messagebox.showinfo, "Success", message)
 
