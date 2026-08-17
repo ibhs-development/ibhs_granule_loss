@@ -24,29 +24,65 @@ For each source image:
 8. Computes percentile-based severity levels and final ratings (`0..3`) per impact.
 9. Produces pooled distribution plots, a per-image CSV summary, and a per-region CSV.
 
-## Scale bar length (10 mm vs 20 mm)
+## Scale bar length (5, 10, 15, 20, 25 or 30 mm)
 
 Areas scale with the **square** of `mm_per_px`, so mistaking a 10 mm bar for a 20 mm one
 makes every reported area **4x too large** and pushes regions across the IGL/PGL cutoff.
 The bar length is therefore resolved in this order, and how it was resolved is always
 reported:
 
-1. **Explicit override** — the GUI's *Scale bar length* setting (`10 mm` / `20 mm`), or
+1. **Explicit override** — the GUI's *Scale bar length* setting (`5 mm` … `30 mm`), or
    `forced_scale_mm=` when calling `process_granule_loss` directly.
-2. **File-name tag** — any image whose name contains `10mm` or `20mm` (e.g. `impact_7_10mm.png`).
-3. **Reading the printed label** next to the bar. Since `10mm` and `20mm` differ only in
-   the first digit, the reader measures that digit's ink width against the `0` beside it,
-   which makes the test independent of font, size and stroke style. Measured over 33 system
-   fonts, a `1` never exceeds `0.944` of the `0` and a `2` never drops below `0.883`; ratios
-   inside that overlap are declared **unresolved** rather than guessed.
-4. **Bar-width guess** (legacy `detect_scale_mm`) — only if the label cannot be read. This is
-   unreliable: it compares the bar to the image width, which assumes a fixed framing. It is
-   flagged as unverified everywhere.
-5. **`DEFAULT_SCALE_BAR_MM`** (20 mm) if even that fails; also flagged.
+2. **File-name tag** — any image whose name contains `5mm`, `10mm`, `15mm`, `20mm`, `25mm`
+   or `30mm` (e.g. `impact_7_15mm.png`). The tag has to stand on its own, so `impact_15mm`
+   reads as 15 mm rather than matching the `5mm` inside it, and `impact_105mm` matches
+   nothing rather than silently becoming 5 mm.
+3. **Reading the printed label** next to the bar (see below).
+4. **`DEFAULT_SCALE_BAR_MM`** (20 mm) if the label cannot be read; flagged as unverified.
 
-Anything resolved by 1-3 is marked `Scale_Verified = True`. For 4-5 the run logs a warning,
+Anything resolved by 1-3 is marked `Scale_Verified = True`. For 4 the run logs a warning,
 the GUI shows the affected images, and the annotated image carries an amber
 `UNVERIFIED` note — fix those by setting the override or tagging the file names.
+
+### How the printed label is read
+
+The six candidates share a rigid structure that does most of the work, so the reader never
+has to identify a free-form number — it scores the six candidate strings and picks one:
+
+- A label is either one digit (`5mm`) or two (`10mm` … `30mm`), so the **glyph count alone**
+  separates `5` from the rest. The only two-digit strings that exist are 10/15/20/25/30, so
+  an impossible reading such as `35mm` can never come out.
+- Each digit glyph is height-normalised (aspect ratio preserved, so a `1` stays narrow),
+  averaged down to a 12x10 grid and compared against mean templates embedded in `loss.py`.
+- A candidate is accepted only if it beats the runner-up by **12%**; anything closer is
+  reported as **unresolved** rather than guessed.
+
+Labels are usually white glyphs with a dark outline, which merges neighbouring strokes — and
+any granule blob they touch — into one blob. The reader therefore also decomposes the label
+into the enclosed white *pockets* inside the ink, which is what makes it robust to blobs
+overlapping the text: a blob merging into the outline does not change the pockets it encloses.
+
+Measured with leave-one-font-out validation over 201 system fonts x 6 lengths x both
+annotation styles:
+
+| labels set in | precision | coverage |
+| --- | --- | --- |
+| text fonts (sans/serif/mono), outlined style | **100%** | 89% |
+| text fonts, plain dark style | **100%** | 57% |
+| held-out decorative & non-Latin faces | 99.2-99.8% | 38-58% |
+
+Coverage is deliberately traded for precision: an unread label costs one override, while a
+misread one silently corrupts every area. Two known limits — **old-style figures** (Georgia,
+Iowan) are never read, because their digits have mixed heights and the glyph-run check
+rejects them; and plain dark text is inherently fragile when a granule blob merges with a
+glyph, since the glyph boundary is genuinely lost.
+
+> `detect_scale_mm` — the legacy 10-vs-20 guess from the bar's width as a fraction of the
+> image width — is **no longer part of this chain**. It cannot express six lengths, and its
+> fixed-framing assumption does not hold: on both reference images in this repo it is wrong
+> by exactly 2x (`Sample_image` is 10 mm and reads as 20, `example_5mm` is 5 mm and reads as
+> 10), which would make every area 4x too large. The function is kept so existing scripts
+> that import it still work.
 
 Every annotated image redraws the bar at its **detected pixel length**, captioned
 `10 mm = 211 px (label)`, and boxes where the bar was found, so the calibration behind the
@@ -92,7 +128,7 @@ In the GUI:
 - Select **Scale-image folder**
 - Select **Results folder** or leave it blank to use `granule_loss_results` under the selected input folder
 - Optionally set **IGL vs PGL Threshold (mm²)** (default: `2.58`)
-- Optionally set **Scale bar length** (default *Auto-detect*; pick `10 mm`/`20 mm` to force it)
+- Optionally set **Scale bar length** (default *Auto-detect*; pick `5 mm` … `30 mm` to force it)
 - Click **Generate Crops + Analyze**
 
 ## Output files
