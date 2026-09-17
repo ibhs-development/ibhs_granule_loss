@@ -158,22 +158,31 @@ In the selected input folder:
 
 ## Build Windows EXE with PyInstaller
 
-From project root:
+Deformation analysis uses the native Tesseract OCR executable; installing the
+Python packages does not install or bundle it. Follow the
+[Tesseract Windows installation instructions](https://tesseract-ocr.github.io/tessdoc/Installation.html),
+make sure its `tessdata\eng.traineddata` file is present, then build from the
+project root with:
 
 ```bash
-pyinstaller --clean --noconfirm --onefile --windowed --name GranuleLoss app.py
+build_windows.bat
 ```
 
 Generated executable:
 - `dist/GranuleLoss.exe`
 
-If your environment misses runtime modules, rebuild with hidden imports:
+The build spec includes `tesseract.exe`, its DLLs, and English language data in
+the one-file application. It searches the usual 64-bit/32-bit installation
+folders. For a custom installation, set its directory before building:
 
-```bash
-pyinstaller --clean --noconfirm --onefile --windowed --name GranuleLoss \
-  --hidden-import matplotlib.backends.backend_tkagg \
-  --hidden-import skimage.measure \
-  app.py
+```bat
+set TESSERACT_DIR=D:\Tools\Tesseract-OCR
+build_windows.bat
 ```
+
+If you intentionally use the original bare PyInstaller command instead, every
+target computer must have Tesseract installed. The app now finds normal Windows
+installations automatically; you can also enter the full path, commonly
+`C:\Program Files\Tesseract-OCR\tesseract.exe`, in **Tesseract command**.
 
 Use the `.exe` by launching it directly, then select input/output folders in the GUI.
