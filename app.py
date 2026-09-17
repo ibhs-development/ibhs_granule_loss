@@ -12,6 +12,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from deformation_analyzer import (
     build_parser as build_deformation_parser,
+    resolve_tesseract_command,
     run as run_deformation_analysis,
     validate_args as validate_deformation_args,
 )
@@ -117,7 +118,9 @@ class GranuleLossApp:
             value=str(_deformation_default("edge_margin_pixels"))
         )
         self.deformation_tesseract_var = tk.StringVar(
-            value=str(_deformation_default("tesseract_command"))
+            value=resolve_tesseract_command(
+                str(_deformation_default("tesseract_command"))
+            )
         )
         self.deformation_status_var = tk.StringVar(value="Ready")
         self.deformation_events = queue.Queue()
@@ -538,7 +541,7 @@ class GranuleLossApp:
             ("Measurement name", self.deformation_name_column_var),
             ("False-color image", self.deformation_image_column_var),
             ("Scaled companion", self.deformation_scale_column_var),
-            ("Color legend (optional)", self.deformation_legend_column_var),
+            ("Color legend", self.deformation_legend_column_var),
             ("Header search rows", self.deformation_header_rows_var),
         )
         for column, (label, variable) in enumerate(column_fields):
