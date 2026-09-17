@@ -364,6 +364,12 @@ def impact_name_from_path(image_path: Path, root_folder: Path) -> str:
     return "_".join(part for part in name.split("_") if part) or image_path.stem
 
 
+def original_impact_name(impact_name: str) -> str:
+    """Return an impact name with any numeric ``_Xmm`` scale tag removed."""
+    without_scale = re.sub(r"_\d+mm(?=_|$)", "", impact_name, flags=re.IGNORECASE)
+    return "_".join(part for part in without_scale.split("_") if part)
+
+
 def generate_image_pairs(
     root_folder: str | Path,
     cropped_suffix: str = CROPPED_SUFFIX,
@@ -1370,6 +1376,7 @@ def process_granule_loss(
 
         rows.append({
             "Impact": impact_name,
+            "Original_Impact": original_impact_name(impact_name),
             "Original_Image": str(p_orig),
             "Cropped_Image": str(p_crop),
             "Annotated_Image": str(annotated_path) if annotated_path is not None else "",
