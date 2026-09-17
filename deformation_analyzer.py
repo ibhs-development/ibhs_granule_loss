@@ -13,7 +13,9 @@ import argparse
 import csv
 import io
 import math
+import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -24,6 +26,80 @@ import numpy as np
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+
+
+def resolve_tesseract_command(command: str = "tesseract") -> str:
+    """Resolve Tesseract from a PyInstaller bundle or a Windows installation."""
+    requested = command.strip()
+    if (
+        len(requested) >= 2
+        and requested[0] == requested[-1]
+        and requested[0] in "\"'"
+    ):
+        requested = requested[1:-1]
+
+    expanded = os.path.expandvars(os.path.expanduser(requested))
+    direct_path = Path(expanded)
+    if direct_path.is_file():
+        return str(direct_path)
+
+    # A path entered explicitly should fail with that exact path instead of silently
+    # selecting a different installation.
+    if direct_path.parent != Path("."):
+        return expanded
+
+    executable_name = "tesseract.exe" if sys.platform == "win32" else "tesseract"
+    candidates: list[Path] = []
+
+    # A one-file PyInstaller application expands bundled files below _MEIPASS.
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.append(Path(bundle_root) / "tesseract" / executable_name)
+    candidates.append(Path(__file__).resolve().parent / "tesseract" / executable_name)
+
+    found_on_path = shutil.which(requested) or shutil.which(executable_name)
+    if found_on_path:
+        candidates.append(Path(found_on_path))
+
+    if sys.platform == "win32":
+        for variable, suffix in (
+            ("ProgramFiles", ("Tesseract-OCR",)),
+            ("ProgramFiles(x86)", ("Tesseract-OCR",)),
+            ("LOCALAPPDATA", ("Programs", "Tesseract-OCR")),
+        ):
+            base = os.environ.get(variable)
+            if base:
+                candidates.append(Path(base).joinpath(*suffix, "tesseract.exe"))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return expanded
+
+
+def require_tesseract_command(command: str = "tesseract") -> str:
+    """Return a runnable Tesseract command or raise one concise setup error."""
+    resolved = resolve_tesseract_command(command)
+    if Path(resolved).is_file() or shutil.which(resolved):
+        return resolved
+    raise RuntimeError(
+        f"Tesseract OCR was not found (requested command: {command!r}). Install "
+        "Tesseract and enter the full path to tesseract.exe, or rebuild the "
+        "Windows executable with build_windows.bat so Tesseract is included."
+    )
+
+
+def _tesseract_environment(
+    tesseract_command: str,
+) -> tuple[str, dict[str, str] | None]:
+    resolved = resolve_tesseract_command(tesseract_command)
+    executable_path = Path(resolved)
+    tessdata = executable_path.parent / "tessdata"
+    if not executable_path.is_file() or not tessdata.is_dir():
+        return resolved, None
+    environment = os.environ.copy()
+    environment["TESSDATA_PREFIX"] = str(tessdata)
+    return resolved, environment
 
 
 @dataclass(frozen=True)
@@ -155,8 +231,9 @@ def _image_png_bytes(image: Image.Image) -> bytes:
 def ocr_tokens(
     image: Image.Image, tesseract_command: str, page_segmentation_mode: int
 ) -> list[dict[str, object]]:
+    resolved_command, environment = _tesseract_environment(tesseract_command)
     command = [
-        tesseract_command,
+        resolved_command,
         "stdin",
         "stdout",
         "--psm",
@@ -169,12 +246,14 @@ def ocr_tokens(
             input=_image_png_bytes(image),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=environment,
             check=True,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Tesseract was not found at {tesseract_command!r}. Install it or "
-            "supply explicit scale/depth calibration options."
+            f"Tesseract OCR was not found (requested command: {tesseract_command!r}). "
+            "Install Tesseract and enter the full path to tesseract.exe, or build "
+            "the Windows executable with the bundled-Tesseract spec file."
         ) from exc
     except subprocess.CalledProcessError as exc:
         message = exc.stderr.decode("utf-8", errors="replace").strip()
@@ -565,6 +644,16 @@ def _draw_text_lines(
     return y
 
 
+def _annotation_scale(image: Image.Image) -> float:
+    """Return a UI scale that tracks image resolution without overflowing it.
+
+    The annotation layout was originally designed around a 640 x 480 image.
+    Scaling against both dimensions keeps text readable on high-resolution
+    images without letting an unusually wide image make the panel too tall.
+    """
+    return max(0.75, min(image.width / 640.0, image.height / 480.0))
+
+
 def annotate_image(
     original: Image.Image,
     regions: Sequence[DentRegion],
@@ -575,6 +664,11 @@ def annotate_image(
     min_area_mm2: float,
     legend_is_clipped: bool,
 ) -> Image.Image:
+    ui_scale = _annotation_scale(original)
+
+    def scaled(value: float, minimum: int = 1) -> int:
+        return max(minimum, int(round(value * ui_scale)))
+
     base = original.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     overlay_array = np.asarray(overlay).copy()
@@ -586,47 +680,74 @@ def annotate_image(
     overlay = Image.fromarray(overlay_array, mode="RGBA")
     composed = Image.alpha_composite(base, overlay)
     draw = ImageDraw.Draw(composed)
-    label_font = _font(max(13, original.width // 27), bold=True)
+    label_font = _font(scaled(24, minimum=13), bold=True)
+    erosion_filter_size = scaled(2, minimum=2) + 1
+    dilation_filter_size = scaled(4, minimum=4) + 1
+    if erosion_filter_size % 2 == 0:
+        erosion_filter_size += 1
+    if dilation_filter_size % 2 == 0:
+        dilation_filter_size += 1
     for index, region in enumerate(regions):
         color = colors[index % len(colors)]
         eroded = np.asarray(
             Image.fromarray((region.mask * 255).astype(np.uint8)).filter(
-                ImageFilter.MinFilter(3)
+                ImageFilter.MinFilter(erosion_filter_size)
             )
         ) > 0
         boundary = region.mask & ~eroded
         outline = Image.fromarray((boundary * 255).astype(np.uint8)).filter(
-            ImageFilter.MaxFilter(5)
+            ImageFilter.MaxFilter(dilation_filter_size)
         )
         stroke = Image.new("RGBA", base.size, color + (255,))
         composed.paste(stroke, (0, 0), outline)
         draw = ImageDraw.Draw(composed)
         x0, y0, x1, y1 = region.bbox
-        draw.rectangle((x0, y0, x1, y1), outline=color + (255,), width=2)
+        draw.rectangle(
+            (x0, y0, x1, y1),
+            outline=color + (255,),
+            width=scaled(2),
+        )
         label = f"Dent {region.label}: {region.volume_mm3:.3f} mm³"
         text_box = draw.textbbox((0, 0), label, font=label_font)
-        label_width = text_box[2] - text_box[0] + 12
-        label_height = text_box[3] - text_box[1] + 9
-        label_x = min(max(2, x0), max(2, original.width - label_width - 2))
-        label_y = max(2, y0 - label_height - 3)
+        horizontal_padding = scaled(6)
+        vertical_padding = scaled(3)
+        edge_margin = scaled(2)
+        label_gap = scaled(3)
+        label_width = text_box[2] - text_box[0] + 2 * horizontal_padding
+        label_height = text_box[3] - text_box[1] + 2 * vertical_padding
+        label_x = min(
+            max(edge_margin, x0),
+            max(edge_margin, original.width - label_width - edge_margin),
+        )
+        label_y = max(edge_margin, y0 - label_height - label_gap)
         draw.rounded_rectangle(
             (label_x, label_y, label_x + label_width, label_y + label_height),
-            radius=4,
+            radius=scaled(4),
             fill=(11, 18, 32, 225),
             outline=color + (255,),
+            width=scaled(1),
         )
-        draw.text((label_x + 6, label_y + 3), label, font=label_font, fill="white")
+        draw.text(
+            (label_x + horizontal_padding, label_y + vertical_padding - text_box[1]),
+            label,
+            font=label_font,
+            fill="white",
+        )
 
-    panel_width = max(310, int(original.width * 0.80))
-    canvas = Image.new("RGB", (original.width + panel_width, original.height), "#0B1220")
+    panel_width = max(scaled(310), int(original.width * 0.80))
+    # Very small/short inputs still need enough vertical space for the summary.
+    canvas_height = max(original.height, scaled(360))
+    canvas = Image.new(
+        "RGB", (original.width + panel_width, canvas_height), "#0B1220"
+    )
     canvas.paste(composed.convert("RGB"), (0, 0))
     panel = ImageDraw.Draw(canvas)
-    pad = 24
+    pad = scaled(24)
     x = original.width + pad
-    title_font = _font(24, bold=True)
-    body_font = _font(13)
-    body_bold = _font(13, bold=True)
-    small_font = _font(11)
+    title_font = _font(scaled(24), bold=True)
+    body_font = _font(scaled(13))
+    body_bold = _font(scaled(13), bold=True)
+    small_font = _font(scaled(11))
     total_volume = sum(region.volume_mm3 for region in regions)
     total_area = sum(region.area_mm2 for region in regions)
     minimum_color_pixels = sum(
@@ -639,28 +760,35 @@ def annotate_image(
 
     y = _draw_text_lines(
         panel,
-        (x, 22),
+        (x, scaled(22)),
         [
             ("Dent volume analysis", title_font, "#F8FAFC"),
             (measurement_name, body_font, "#A9B8CD"),
         ],
-        spacing=9,
+        spacing=scaled(9),
     )
-    y += 8
+    y += scaled(8)
+    total_box_height = scaled(68)
     panel.rounded_rectangle(
-        (x, y, canvas.width - pad, y + 68),
-        radius=10,
+        (x, y, canvas.width - pad, y + total_box_height),
+        radius=scaled(10),
         fill="#162237",
         outline="#30415C",
+        width=scaled(1),
     )
-    panel.text((x + 16, y + 10), "TOTAL VOLUME", font=small_font, fill="#8FA4BF")
     panel.text(
-        (x + 16, y + 29),
+        (x + scaled(16), y + scaled(10)),
+        "TOTAL VOLUME",
+        font=small_font,
+        fill="#8FA4BF",
+    )
+    panel.text(
+        (x + scaled(16), y + scaled(29)),
         f"{total_volume:.3f} mm³",
         font=title_font,
         fill="#FFFFFF",
     )
-    y += 82
+    y += scaled(82)
     summary_lines = [
         (f"Dents retained: {len(regions)}", body_bold, "#E6EDF7"),
         (f"Total area: {total_area:.2f} mm²", body_font, "#CFD8E6"),
@@ -678,24 +806,35 @@ def annotate_image(
         (f"Dent threshold: ≤ {threshold_mm:.4g} mm", body_font, "#CFD8E6"),
         (f"Minimum region area: {min_area_mm2:.3g} mm²", body_font, "#CFD8E6"),
     ]
-    y = _draw_text_lines(panel, (x, y), summary_lines, spacing=4)
+    y = _draw_text_lines(panel, (x, y), summary_lines, spacing=scaled(4))
     if legend_is_clipped and minimum_color_fraction > 0:
-        y += 8
+        y += scaled(8)
         warning = (
             "LOWER-BOUND VOLUME\n"
             f"{minimum_color_fraction:.1%} of dent pixels hit the legend minimum."
         )
-        warning_box = (x, y, canvas.width - pad, min(canvas.height - 8, y + 54))
-        panel.rounded_rectangle(warning_box, radius=8, fill="#4A2B12", outline="#F59E0B")
+        warning_box = (
+            x,
+            y,
+            canvas.width - pad,
+            min(canvas.height - scaled(8), y + scaled(54)),
+        )
+        panel.rounded_rectangle(
+            warning_box,
+            radius=scaled(8),
+            fill="#4A2B12",
+            outline="#F59E0B",
+            width=scaled(1),
+        )
         panel.multiline_text(
-            (x + 12, y + 9),
+            (x + scaled(12), y + scaled(9)),
             warning,
             font=small_font,
             fill="#FFD58A",
-            spacing=3,
+            spacing=scaled(3),
         )
     elif not regions:
-        y += 8
+        y += scaled(8)
         panel.text((x, y), "No qualifying dent region found.", font=body_bold, fill="#9EE6B0")
     return canvas
 
@@ -848,6 +987,19 @@ def run(args: argparse.Namespace) -> Path:
     source_stem = safe_filename(args.input_xlsx.stem)
 
     override_scale = explicit_scale(args)
+    explicit_depth_range = (
+        (args.depth_min_mm, args.depth_max_mm)
+        if args.depth_min_mm is not None
+        else None
+    )
+    ocr_required = override_scale is None or (
+        legend_column is not None and explicit_depth_range is None
+    )
+    tesseract_command = (
+        require_tesseract_command(args.tesseract_command)
+        if ocr_required
+        else args.tesseract_command
+    )
     row_scales: dict[int, ScaleCalibration] = {}
     scale_errors: dict[int, str] = {}
     usable_rows: list[int] = []
@@ -871,7 +1023,7 @@ def run(args: argparse.Namespace) -> Path:
             continue
         try:
             row_scales[row] = calibrate_scale(
-                color, scale_image, args.tesseract_command
+                color, scale_image, tesseract_command
             )
         except (RuntimeError, ValueError) as exc:
             scale_errors[row] = str(exc)
@@ -882,11 +1034,6 @@ def run(args: argparse.Namespace) -> Path:
     fallback_scale = median_scale(row_scales.values()) if row_scales else override_scale
     assert fallback_scale is not None
 
-    explicit_depth_range = (
-        (args.depth_min_mm, args.depth_max_mm)
-        if args.depth_min_mm is not None
-        else None
-    )
     row_legends: dict[int, LegendCalibration] = {}
     if legend_column is not None:
         legend_errors: dict[int, str] = {}
@@ -902,7 +1049,7 @@ def run(args: argparse.Namespace) -> Path:
             try:
                 row_legends[row] = calibrate_legend(
                     legend_image=legend_image,
-                    tesseract_command=args.tesseract_command,
+                    tesseract_command=tesseract_command,
                     max_abs_depth_mm=args.ocr_max_abs_depth_mm,
                     explicit_depth_range=explicit_depth_range,
                 )
